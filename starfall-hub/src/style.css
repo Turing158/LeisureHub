@@ -1,0 +1,333 @@
+/* ── 全局重置 ─────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family:
+    'Inter',
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    'PingFang SC',
+    'Hiragino Sans GB',
+    'Microsoft YaHei',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--color-text);
+  background: var(--bg-base);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+
+input {
+  font: inherit;
+  color: inherit;
+}
+
+/* ── 设计令牌 ─────────────────────────────────────────── */
+
+:root {
+  /* 布局 */
+  --grid-padding: 24px;
+  --gap: 20px;
+  --label-gap: 8px;
+  --label-height: 18px;
+  --tile-size: 75px;
+
+  /* ── 间距刻度 ─────────────────────────────────────
+   * 组件内的 padding / gap 一律取这五档。
+   * 改造前散落着 6/7/8/9/10/11/12/14/16/18/22/24px 十余种字面量，
+   * 收敛后「面板留白该多大」不再是每个组件各自的判断。
+   */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+
+  /* ── 字号刻度 ─────────────────────────────────────
+   * 方格内的字号仍按 calc(--content-size * k) 比例算，不读这些档位：
+   * 它要随方块尺寸缩放，本质是另一套度量。
+   */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 15px;
+  --fs-lg: 16px;
+
+  /* ── 底色与面板 ───────────────────────────────────
+   * 全部无色相：三个面板档位之间只有明度差。
+   * 深色界面里的「层次」本就该由明度承担，掺进色相会让每个浮层
+   * 看起来像来自不同的设计系统。
+   */
+  --bg-base: #0e0e11;
+  --surface-1: #17171b;
+  --surface-2: #1a1a1f;
+  --surface-3: #1c1c21;
+
+  /* ── 文字四档 ─────────────────────────────────────
+   * 改造前有 .92/.88/.55/.5/.45/.4/.3/.28 八档，其中多数只差 0.05，
+   * 肉眼分辨不出却让「次要文字该多淡」每次都要重新决定。
+   *
+   * faint 取 0.5 而不是更低：它承载的是提示语（group__hint、field__hint），
+   * 属于要读的正文，在面板底色上是 4.7:1，压到 0.4 就只有 3.5:1 了。
+   *
+   * disabled 单独一档并刻意低于门槛——禁用控件不在 WCAG 对比度要求内，
+   * 且它必须明显淡于 faint，否则「不可点」这件事只剩鼠标指针在表达。
+   */
+  --color-text: #ededf0;
+  --color-text-dim: rgb(237 237 240 / 0.6);
+  --color-text-faint: rgb(237 237 240 / 0.5);
+  --color-text-disabled: rgb(237 237 240 / 0.28);
+
+  /* ── 描边三档 ─────────────────────────────────────
+   * subtle 是面板内部的分隔线，line 是面板外缘与输入框，
+   * strong 只在 hover 时出现。改造前这三种用途混用 .06~.18 共六档。
+   */
+  --line-subtle: rgb(255 255 255 / 0.06);
+  --line: rgb(255 255 255 / 0.09);
+  --line-strong: rgb(255 255 255 / 0.16);
+
+  /* ── 填充三档 ─────────────────────────────────────
+   * fill 是凹陷面（输入框、分段控件轨道），
+   * raised 是浮起面（分段滑块、按钮），hover 是两者的悬停态。
+   */
+  --fill: rgb(255 255 255 / 0.06);
+  --fill-raised: rgb(255 255 255 / 0.1);
+  --fill-hover: rgb(255 255 255 / 0.14);
+
+  /* ── 方格 ─────────────────────────────────────────
+   * 指向上面的填充档位而不是另写一组 alpha：
+   * 否则方格与浮层各自维护一套白色不透明度，改一处必漏另一处。
+   */
+  --tile-bg: var(--fill);
+  --tile-bg-hover: var(--fill-hover);
+  --tile-border: rgb(255 255 255 / 0.14);
+  /*
+   * 组件方块内的信息条（如日历底部的年份）。
+   *
+   * 刻意比 --tile-bg 更实：它的作用是给组件一条能被一眼认出的边界，
+   * 与半透明玻璃底拉开明度差；同时压在上面的文字仍要满足对比度，
+   * 所以底色偏亮而文字取全不透明白。
+   */
+  --widget-band-bg: rgb(255 255 255 / 0.16);
+  --widget-band-text: rgb(255 255 255 / 0.95);
+
+  /* ── 强调与焦点 ───────────────────────────────────
+   * 三者分工，不是一回事：
+   *
+   * --focus 是焦点环，取中性亮白。焦点靠「位置 + 粗细」表意，
+   * 不需要颜色参与，用彩色反而在每种底色上都要重新验一次对比度。
+   * 对四档面板底色均在 7.7:1 以上。
+   *
+   * --accent 只用于二元状态的标记（开关轨道、色板选中环、拖拽落点）。
+   * 这类状态若也用灰，开与关就只差明度，小屏与弱视下极易误读，
+   * 所以这里保留唯一一处色相——但比 indigo-500 更冷更暗，不发光。
+   * 对面板 4.9:1，作为图形边界远超 3:1 的要求；开关的浅色 thumb
+   * 压在它上面是 3.2:1，同样满足非文本组件的门槛。
+   *
+   * --accent-solid 是「文字压在强调色块面上」这一种情况专用（如主按钮）。
+   * --accent 本身太亮：--color-text 压上去只有 3.2:1，达不到正文的 4.5:1。
+   * 压暗一档后是 5.1:1。两者同色相，观感上是同一个颜色的深浅。
+   */
+  --focus: rgb(237 237 240 / 0.7);
+  --accent: #5b7cfa;
+  --accent-solid: #4459cc;
+
+  /* 危险动作（删除）：在深色面板上对比度 > 4.5:1 */
+  --danger: #fca5a5;
+  --danger-bg: rgb(248 113 113 / 0.16);
+
+  /* ── 阴影三档 ─────────────────────────────────────
+   * 值统一之外更重要的是收紧扩散半径：改造前抽屉是 0 32px 80px，
+   * 大范围柔散的「发光式」阴影会让面板像浮在雾里而不是压在页面上。
+   */
+  --shadow-sm: 0 1px 3px rgb(0 0 0 / 0.4);
+  --shadow-md: 0 4px 12px rgb(0 0 0 / 0.35);
+  --shadow-lg: 0 12px 32px rgb(0 0 0 / 0.45);
+
+  /* 浮层层级：统一在此定义，组件不写魔法数字 */
+  --z-drag: 900;
+  --z-handle: 900;
+  /*
+   * 搜索弹层夹在拖拽浮层与 Dialog 之间：它要盖住拖过来的方块，
+   * 但不该盖住 Dialog 与抽屉——那两者是模态，出现时搜索弹层已经收起了。
+   */
+  --z-suggest: 950;
+  --z-engine-menu: 950;
+  --z-dialog: 1000;
+  --z-drawer: 1100;
+  /* 菜单在最上层：它随时可被任意浮层打断，显示期间不该被任何东西盖住 */
+  --z-menu: 1200;
+
+  /* ── 圆角 ─────────────────────────────────────────
+   * 四档收敛改造前的 6/8/9/10/11/12/18px。
+   * --r-lg 取 14 而非原来的 18：18px 偏圆润，收紧后更接近工具类界面。
+   */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-full: 999px;
+
+  /* 面板圆角沿用 --r-lg，保留此名是因为编辑面板的预览框会局部覆写它 */
+  --panel-radius: var(--r-lg);
+
+  /*
+   * 方格圆角改用「比例 × 短边」而非百分比：跨格方块不是正方形，
+   * 百分比会在两个轴上各取一次，算出椭圆角。
+   *
+   * 比例之外再压一道上限。比例乘出来的半径在 4×4（短边 360px）是 79px，
+   * 四角切掉的那一块正好压在月历首末行的日号上；1×1 的 16.5px 落在上限
+   * 之下，取 min 后与改动前完全一致，只有跨格的大方块会被收窄。
+   *
+   * 上限写成定长而不是 calc(var(--tile-size) * k)：自定义属性的 var() 在
+   * 声明它的元素（这里是 :root）上就被代换掉了，写成公式也读不到调用处
+   * 局部覆写的 --tile-size。需要缩放的地方（编辑面板的预览框）自行覆写本项。
+   *
+   * 这两项不参与上面的圆角收敛：方格圆角是产品识别度所在。
+   */
+  --tile-radius-ratio: 0.22;
+  --tile-radius-max: 26px;
+
+  /*
+   * 磨砂令牌。
+   *
+   * 每个玻璃面的 backdrop-filter 与配套底色成对定义在这里，组件只读令牌。
+   * 关闭磨砂时只需在 html[data-glass='off'] 上整体换档，
+   * 不必从全局表反向覆写各组件的 scoped 样式。
+   *
+   * 全部不带 saturate()：提饱和度是玻璃「泛色发艳」的根源，
+   * 它会把背景里任何一点色相放大成整块面板的色调。
+   *
+   * 七个面统一 10px 而非改造前的 18/20/24/24/28px：差异化的半径肉眼
+   * 分辨不出，只是让每个浮层各付一次不同成本的全屏读回。
+   *
+   * 玻璃面共 7 个：scrim / drawer / panel / menu / toast / handle / search。
+   * 新增一面时下面两个降级块（html[data-glass='off'] 与
+   * prefers-reduced-transparency）都要同步补上，缺一处就会在那个环境下跳回旧配色。
+   */
+  --glass-scrim: blur(var(--scrim-blur-radius, 10px));
+  --glass-drawer: blur(10px);
+  --glass-panel: blur(10px);
+  --glass-menu: blur(10px);
+  --glass-toast: blur(10px);
+  --glass-handle: blur(10px);
+  --glass-search: blur(10px);
+
+  /* 底色 alpha 提到 .92 以上：模糊半径降下来后，靠底色本身保证可读性 */
+  --bg-drawer: rgb(23 23 27 / 0.92);
+  --bg-panel: rgb(26 26 31 / 0.92);
+  --bg-menu: rgb(28 28 33 / 0.94);
+  --bg-toast: rgb(28 28 33 / 0.94);
+  --bg-handle: rgb(28 28 33 / 0.85);
+  /* 建议列表与右键菜单同一档：两者都是贴着触发元素展开的轻量浮层 */
+  --bg-search: rgb(28 28 33 / 0.94);
+
+  /* 遮罩压暗层：不透明度由设置里的滑块写成行内 --scrim-opacity */
+  --scrim-tint: rgb(6 6 8 / var(--scrim-opacity, 0.42));
+  --overlay-tint: rgb(6 6 8 / var(--scrim-opacity, 0.42));
+
+  /* 动效 */
+  --dur-fast: 140ms;
+  --dur-base: 240ms;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+
+
+}
+
+/*
+ * 动效总闸由设置 store 写在 <html data-motion> 上：
+ * system 档会把系统的 prefers-reduced-motion 折算进来，所以这里不再单独写媒体查询，
+ * 否则「始终开启」会被系统偏好反悔掉。
+ */
+html[data-motion='off'] *,
+html[data-motion='off'] *::before,
+html[data-motion='off'] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+/* JS 未执行（首帧 / 脚本失败）时仍尊重系统偏好 */
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-motion]) *,
+  html:not([data-motion]) *::before,
+  html:not([data-motion]) *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/*
+ * 磨砂总闸，与 data-motion 同构：system 档已把系统的
+ * prefers-reduced-transparency 折算进来，所以这里不再单独写媒体查询，
+ * 否则「始终开启」会被系统偏好反悔掉。
+ *
+ * 只换令牌不覆写组件样式：各玻璃面的 backdrop-filter 全部读 var(--glass-*)，
+ * 在此把它们置 none 并把底色换成对应的不透明兜底值即可。
+ */
+html[data-glass='off'] {
+  --glass-scrim: none;
+  --glass-drawer: none;
+  --glass-panel: none;
+  --glass-menu: none;
+  --glass-toast: none;
+  --glass-handle: none;
+  --glass-search: none;
+
+  /* 兜底色直接取无色相的面板档位，不另写 hex——旧版这里是一组偏蓝的字面量 */
+  --bg-drawer: var(--surface-1);
+  --bg-panel: var(--surface-2);
+  --bg-menu: var(--surface-3);
+  --bg-toast: var(--surface-3);
+  --bg-handle: var(--surface-3);
+  --bg-search: var(--surface-3);
+
+  /* 失去模糊后背景细节会透上来，压暗层需要更实才能保住可读性 */
+  --scrim-tint: rgb(6 6 8 / 0.82);
+  --overlay-tint: rgb(6 6 8 / 0.82);
+}
+
+/* JS 未执行时同样尊重系统的「降低透明度」 */
+@media (prefers-reduced-transparency: reduce) {
+  html:not([data-glass]) {
+    --glass-scrim: none;
+    --glass-drawer: none;
+    --glass-panel: none;
+    --glass-menu: none;
+    --glass-toast: none;
+    --glass-handle: none;
+    --glass-search: none;
+    --bg-drawer: var(--surface-1);
+    --bg-panel: var(--surface-2);
+    --bg-menu: var(--surface-3);
+    --bg-toast: var(--surface-3);
+    --bg-handle: var(--surface-3);
+    --bg-search: var(--surface-3);
+    --scrim-tint: rgb(6 6 8 / 0.82);
+    --overlay-tint: rgb(6 6 8 / 0.82);
+  }
+}
+
