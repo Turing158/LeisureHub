@@ -122,7 +122,7 @@ const emit = defineEmits<{
  * 真正要被看到的是下面那些词，标题只回答「这些词是哪来的」。
  */
 .recent__title {
-  color: var(--color-text-faint);
+  color: var(--sw-sub-text, var(--color-text-faint));
   font-size: var(--fs-xs);
   letter-spacing: 0.03em;
   line-height: 1;
@@ -132,14 +132,14 @@ const emit = defineEmits<{
   padding: 2px 4px;
   margin: -2px -4px;
   border-radius: var(--r-sm);
-  color: var(--color-text-faint);
+  color: var(--sw-sub-text, var(--color-text-faint));
   font-size: var(--fs-xs);
   line-height: 1;
   transition: color var(--dur-fast) var(--ease);
 }
 
 .recent__clear:hover {
-  color: var(--color-text);
+  color: var(--sw-text, var(--color-text));
 }
 
 .recent__clear:focus-visible {
@@ -149,7 +149,7 @@ const emit = defineEmits<{
 
 .recent__empty {
   margin: 0;
-  color: var(--color-text-disabled);
+  color: var(--sw-sub-text, var(--color-text-disabled));
   font-size: var(--fs-xs);
   line-height: 1.5;
 }
@@ -178,8 +178,9 @@ const emit = defineEmits<{
   overflow: hidden;
   border: 1px solid transparent;
   border-radius: var(--r-full);
-  background: var(--fill);
-  color: var(--color-text-dim);
+  /* 记录 chip 与引擎 chip 同属方块内的次要面板，共用同一档次要背景 */
+  background: var(--sw-sub-bg, var(--fill));
+  color: var(--sw-text, var(--color-text-dim));
   transition:
     background-color var(--dur-fast) var(--ease),
     border-color var(--dur-fast) var(--ease),
@@ -188,8 +189,8 @@ const emit = defineEmits<{
 
 .recent__item:hover {
   border-color: var(--line-strong);
-  background: var(--fill-hover);
-  color: var(--color-text);
+  background: var(--sw-sub-bg, var(--fill-hover));
+  color: var(--sw-text, var(--color-text));
 }
 
 .recent__pick {

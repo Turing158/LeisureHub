@@ -3,18 +3,20 @@ import { nanoid } from 'nanoid'
 import { computed, ref, watch } from 'vue'
 
 import {
+  DEFAULT_GRID_COLS,
+  DEFAULT_GRID_ROWS,
   GRID_SCHEMA_VERSION,
+  setGridCols,
   tileSpan,
   type GridState,
   type Tile,
   type TileDraft,
 } from '@/types/tile'
+import { buildDefaultGrid } from '@/data/defaults'
 import { isHexColor } from '@/utils/color'
 import { sanitizeWidgetProps } from '@/types/widgetProps'
 
 const STORAGE_KEY = 'starfall-hub:grid'
-const DEFAULT_COLS = 8
-const DEFAULT_ROWS = 4
 
 function emptySlots(count: number): (Tile | null)[] {
   return Array.from({ length: count }, () => null)
@@ -141,8 +143,16 @@ function pushInto(
   return true
 }
 
-/** 校验并夹紧单个方块，挡住 localStorage 里被改过的脏数据 */
-function sanitizeTile(value: unknown): Tile | null {
+/**
+ * 校验并夹紧单个方块，挡住 localStorage 里被改过的脏数据。
+ *
+ * keepSpan 供 overflow 暂存区用：那些方块正因为「当前网格放不下」才被摘出来，
+ * 宽度是按**当时的**列数写的，可能大于现在的列数——按当前列数夹会把一条合法
+ * 的暂存悄悄改小，网格重新变宽后也回不来了。暂存里的占格不参与渲染与落位
+ * 计算（所有读取都走 tileSpan 现夹），原样保留是安全的；脏数据最多在暂存里
+ * 多躺几轮，真要落位时仍会被 resolvePlacement 夹住。
+ */
+function sanitizeTile(value: unknown, keepSpan = false): Tile | null {
   if (!value || typeof value !== 'object') return null
   const tile = value as Tile
   if (tile.kind !== 'link' && tile.kind !== 'widget') return null
@@ -162,8 +172,12 @@ function sanitizeTile(value: unknown): Tile | null {
    * 而存档里可能是 1（手改过，或来自「搜索还是 1..4」的旧版本）。
    * 两次裸 clampSpan 只认全局的 1..SPAN_MAX，那个 1 会被原样留下。
    */
-  const span = tileSpan(tile)
-  const next = { ...tile, spanW: span.w, spanH: span.h } as Tile
+  const next = { ...tile } as Tile
+  if (!keepSpan) {
+    const span = tileSpan(tile)
+    next.spanW = span.w
+    next.spanH = span.h
+  }
   // 底色会直接进 background，非法值一律丢弃而不是照原样渲染
   if (next.kind === 'link' && next.bgColor !== undefined && !isHexColor(next.bgColor)) {
     delete next.bgColor
@@ -181,35 +195,62 @@ function sanitizeTile(value: unknown): Tile | null {
 }
 
 export const useGridStore = defineStore('grid', () => {
-  const cols = ref(DEFAULT_COLS)
-  const rows = ref(DEFAULT_ROWS)
-  const slots = ref<(Tile | null)[]>(emptySlots(DEFAULT_COLS * DEFAULT_ROWS))
+  const cols = ref(DEFAULT_GRID_COLS)
+  const rows = ref(DEFAULT_GRID_ROWS)
+  const slots = ref<(Tile | null)[]>(emptySlots(DEFAULT_GRID_COLS * DEFAULT_GRID_ROWS))
   /**
    * 网格缩小时挤出来的方块。
    * 暂存而不丢弃，窗口重新变大后 resize 会按顺序放回空位。
    */
   const overflow = ref<Tile[]>([])
 
-  /** 读取持久化数据；版本或长度不匹配一律回退默认空网格，避免脏数据白屏 */
+  /**
+   * 装入默认布局（见 data/defaults.ts）。
+   *
+   * 首次打开与「重置为默认」共用这一处，也是**读盘失败时的落点**——空网格曾经是
+   * 那个落点，但「默认」现在有了内容，两条路各给一种结果就等于同一个概念有两个答案。
+   *
+   * 先 setGridCols 再赋值，与 load / resize 同一条顺序纪律：所有 tileSpan 读取
+   * （搜索方块的宽度上限跟随列数）都必须看到新的列数。
+   */
+  function seedDefaults() {
+    const seed = buildDefaultGrid()
+    setGridCols(seed.cols)
+    cols.value = seed.cols
+    rows.value = seed.rows
+    slots.value = seed.slots
+    overflow.value = []
+  }
+
+  /**
+   * 读取持久化数据；版本或长度不匹配一律回退默认布局，避免脏数据白屏。
+   *
+   * 「回退」不再是空网格而是 seedDefaults()：见它的注释。存档存在但非法与
+   * 从未存过档，对用户是同一件事——他看到的都该是这个项目的默认桌面。
+   */
   function load() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY)
-      if (!raw) return
+      if (!raw) return seedDefaults()
 
       const parsed = JSON.parse(raw) as GridState
-      if (parsed?.version !== GRID_SCHEMA_VERSION) return
-      if (!Number.isInteger(parsed.cols) || !Number.isInteger(parsed.rows)) return
-      if (!Array.isArray(parsed.slots)) return
-      if (parsed.slots.length !== parsed.cols * parsed.rows) return
+      if (parsed?.version !== GRID_SCHEMA_VERSION) return seedDefaults()
+      if (!Number.isInteger(parsed.cols) || !Number.isInteger(parsed.rows)) return seedDefaults()
+      if (!Array.isArray(parsed.slots)) return seedDefaults()
+      if (parsed.slots.length !== parsed.cols * parsed.rows) return seedDefaults()
 
       cols.value = parsed.cols
+      // 先同步再夹取：sanitizeTile → tileSpan 要按这一份列数算搜索的宽度上限
+      setGridCols(parsed.cols)
       rows.value = parsed.rows
-      slots.value = parsed.slots.map(sanitizeTile)
+      // 箭头包一层：map 会把元素下标当第二个参数塞进来，正好撞上 keepSpan
+      slots.value = parsed.slots.map((tile) => sanitizeTile(tile))
       overflow.value = Array.isArray(parsed.overflow)
-        ? parsed.overflow.map(sanitizeTile).filter((tile): tile is Tile => tile !== null)
+        ? parsed.overflow.map((tile) => sanitizeTile(tile, true)).filter((tile): tile is Tile => tile !== null)
         : []
     } catch {
-      // 非法 JSON：保持默认空网格
+      // 非法 JSON：同样落到默认布局
+      seedDefaults()
     }
   }
 
@@ -262,8 +303,9 @@ export const useGridStore = defineStore('grid', () => {
    * 这样拖一个 2×2 到最后一列也能落下，而不是被判为非法。
    *
    * 这里只夹「网格装不装得下」，**不再夹 SPAN_MAX**：入参一律来自 tileSpan，
-   * 已按那一种方块自己的上下限夹过了。再套一次全局的 1..4 会把搜索方块的
-   * 5、6 格宽悄悄压回 4——用户在编辑框里选了 6，保存后变成 4，且没有任何提示。
+   * 已按那一种方块自己的上下限夹过了。再套一次全局的 1..4 会把搜索方块
+   * 4 格以上的宽度悄悄压回 4——用户在编辑框里选了更宽的档，保存后变成 4，
+   * 且没有任何提示。
    */
   function resolvePlacement(index: number, w: number, h: number) {
     const sw = Math.min(Math.max(1, Math.trunc(w) || 1), cols.value)
@@ -470,6 +512,8 @@ export const useGridStore = defineStore('grid', () => {
       if (!placed) rest.push(tile)
     }
 
+    // 先同步再提交：提交后的所有 tileSpan 读取都按新列数算搜索的宽度上限
+    setGridCols(nextCols)
     cols.value = nextCols
     rows.value = nextRows
     slots.value = next
@@ -492,6 +536,14 @@ export const useGridStore = defineStore('grid', () => {
     restoreTile,
     moveTile,
     resize,
+    /**
+     * 重置为默认布局。
+     *
+     * 就是 seedDefaults 本身，只换一个对外的名字：store 内部「读盘失败的落点」
+     * 与设置里「重置为默认」要的是同一个结果，两处若各写一份，改默认布局时
+     * 必然漏改一处。不在这里 persist——watch 会自动落盘。
+     */
+    reset: seedDefaults,
     load,
     persist,
   }

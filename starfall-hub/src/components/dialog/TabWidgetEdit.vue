@@ -2,6 +2,8 @@
 import { computed, ref } from 'vue'
 
 import ColorSwatches from './ColorSwatches.vue'
+import CustomPanel from './CustomPanel.vue'
+import DateField from './DateField.vue'
 import PlaceField from './PlaceField.vue'
 import TilePreview from './TilePreview.vue'
 import SegmentedControl from '../settings/SegmentedControl.vue'
@@ -9,7 +11,12 @@ import EngineChips from '../widgets/search/EngineChips.vue'
 import { getWidget } from '@/data/widgets'
 import { useSettingsStore } from '@/stores/settings'
 import { tileSpan, widgetSpanLimits, type TileDraft, type WidgetTile } from '@/types/tile'
-import { widgetColorFields, widgetEngineField, widgetHasPlace } from '@/types/widgetProps'
+import {
+  widgetColorFields,
+  widgetEngineField,
+  widgetFieldByKind,
+  widgetHasPlace,
+} from '@/types/widgetProps'
 
 const props = defineProps<{
   /** 被编辑的组件方块；本 tab 只用于编辑，没有新建路径 */
@@ -22,13 +29,34 @@ const emit = defineEmits<{
 
 const settings = useSettingsStore()
 
+/** 名称会在方格下被单行截断，这里给出软上限提示，与 TabCustom 同一个数 */
+const NAME_MAX = 20
+
+/**
+ * 名称的本地副本。
+ *
+ * 与链接不同，这里**允许留空**：空名称的方块不渲染名称行，方格顺势长到
+ * 名称原本所在的位置（见 TileCell 的 --label-block）。日历、天气这类
+ * 内容本身就是信息的组件常常不需要一个写着「日历」的标签，多出来的
+ * 26px 给内容更值。所以这里没有校验，也不给它补默认名。
+ */
+const name = ref(props.tile.name)
+
+const nameLeft = computed(() => NAME_MAX - [...name.value].length)
+
+/** 空名称即「不要名称行」，传 undefined 让 TilePreview 收掉那一行 */
+const previewLabel = computed(() => name.value.trim() || undefined)
+
 /**
  * 尺寸档位按这一种组件自己的范围生成。
  *
- * 搜索方块是宽 2..6、高 1..2，其余组件仍是 1..4。写死 1..SPAN_MAX 的话，
- * 搜索的编辑框会露出一个点了会被夹回去的 1 档，以及缺掉真正可用的 5、6 档。
+ * 搜索方块是宽 2..当前网格列数（宽上限跟随网格，见 SEARCH_SPAN_LIMITS）、
+ * 高 1..2，其余组件仍是 1..4。写死 1..SPAN_MAX 的话，搜索的编辑框会露出一个
+ * 点了会被夹回去的 1 档，还会缺掉宽档位里真正的上限。
  *
- * SegmentedControl 的泛型约束是 string，档位用字符串，提交时再转数字。
+ * limits 读到 tile.ts 里响应式的 gridCols：抽屉开着时网格列数变了，
+ * 档位会跟着重算。SegmentedControl 的泛型约束是 string，档位用字符串，
+ * 提交时再转数字。
  */
 const limits = computed(() => widgetSpanLimits(props.tile.widgetId))
 
@@ -46,6 +74,10 @@ const def = computed(() => getWidget(props.tile.widgetId))
 const fields = computed(() => widgetColorFields(props.tile.widgetId))
 const hasPlace = computed(() => widgetHasPlace(props.tile.widgetId))
 const engineField = computed(() => widgetEngineField(props.tile.widgetId))
+/** 倒计时的日期区；两个键共用一个控件，所以只取第一条判「要不要插这一段」 */
+const dateField = computed(() => widgetFieldByKind(props.tile.widgetId, 'date'))
+/** 倒计时的自定义区；kind === 'custom' 的字段集合成一个折叠面板 */
+const hasCustom = computed(() => widgetFieldByKind(props.tile.widgetId, 'custom') !== undefined)
 
 /*
  * 初值走 tileSpan，它已按这一种方块的上下限夹过。
@@ -107,6 +139,44 @@ const engineId = ref(
 const currentEngine = computed(() => settings.resolveEngine(engineId.value))
 
 /**
+ * 目标日期的本地副本。
+ *
+ * 两个键一起存一份，与 place 的三键同一条约定：它们是一个整体，分开存会在
+ * 「改了重复开关、日期还是旧值」时让预览按错的组合算一次天数。
+ *
+ * 空串表示未设置（与颜色 / 引擎的约定一致）；repeatYearly 只在日期非空时才有意义，
+ * 提交时由 previewProps 的「成对才写」保证。
+ */
+const date = ref({
+  targetDate: typeof props.tile.props?.targetDate === 'string' ? props.tile.props.targetDate : '',
+  repeatYearly: props.tile.props?.repeatYearly === true,
+})
+
+/**
+ * 自定义装饰的本地副本。
+ *
+ * 七个键一起存一份：它们是一组可选的附加项，分开存会让预览按不完整的组合渲染。
+ * 各字段留空表示未设置（与颜色 / 引擎同一条约定）；跨键约束由 FINALIZE.countdown 保证。
+ */
+const custom = ref<{
+  customText?: string
+  customTextColor?: string
+  customTextSize?: number
+  customTextWeight?: number | 'normal' | 'bold'
+  customImageSource?: 'none' | 'url' | 'local'
+  customImageUrl?: string
+  customImageData?: string
+}>({
+  customText: typeof props.tile.props?.customText === 'string' ? props.tile.props.customText : undefined,
+  customTextColor: typeof props.tile.props?.customTextColor === 'string' ? props.tile.props.customTextColor : undefined,
+  customTextSize: typeof props.tile.props?.customTextSize === 'number' ? props.tile.props.customTextSize : undefined,
+  customTextWeight: (props.tile.props?.customTextWeight ?? undefined) as number | 'normal' | 'bold' | undefined,
+  customImageSource: (props.tile.props?.customImageSource ?? undefined) as 'none' | 'url' | 'local' | undefined,
+  customImageUrl: typeof props.tile.props?.customImageUrl === 'string' ? props.tile.props.customImageUrl : undefined,
+  customImageData: typeof props.tile.props?.customImageData === 'string' ? props.tile.props.customImageData : undefined,
+})
+
+/**
  * 实时预览。
  *
  * 组件按 props 名接收配置，与 TileWidget 走的是同一条路径，
@@ -130,13 +200,49 @@ const previewProps = computed(() => {
     }
   }
   if (engineField.value && engineId.value) next.engineId = engineId.value
+  if (dateField.value && date.value.targetDate) {
+    next.targetDate = date.value.targetDate
+    /*
+     * 成对才写，与 FINALIZE.countdown 同一条规则（没有日期时重复开关无意义）。
+     * 且**关着时也不写**：一个 repeatYearly: false 与「没配过」是同一个意思，
+     * 写进去只会让存档多一个键，与颜色字段「空串不写」是同一条纪律。
+     */
+    if (date.value.repeatYearly) next.repeatYearly = true
+  }
+  if (hasCustom.value && custom.value) {
+    if (custom.value.customText?.trim()) {
+      next.customText = custom.value.customText.trim()
+      if (custom.value.customTextColor) next.customTextColor = custom.value.customTextColor
+      if (custom.value.customTextSize && custom.value.customTextSize > 0) next.customTextSize = custom.value.customTextSize
+      if (custom.value.customTextWeight && custom.value.customTextWeight !== 'normal') next.customTextWeight = custom.value.customTextWeight
+    }
+    if (custom.value.customImageSource && custom.value.customImageSource !== 'none') {
+      next.customImageSource = custom.value.customImageSource
+      if (custom.value.customImageSource === 'url' && custom.value.customImageUrl?.trim()) {
+        next.customImageUrl = custom.value.customImageUrl.trim()
+      }
+      if (custom.value.customImageSource === 'local' && custom.value.customImageData) {
+        next.customImageData = custom.value.customImageData
+      }
+    }
+  }
   return next
 })
 
 /**
+ * 内容自己吃指针的组件（搜索、待办）。
+ *
+ * 下面三处判定原本各写一份 `widgetId === 'search'`，注释里写着「第二个需要 zoom 的
+ * 组件出现时再抽」——待办就是第二例，所以三处一并改读注册表的 WidgetDef.interactive
+ * （TileCell.isInteractive 是同一个字段的第四处）。它们判的是同一件事：
+ * 这个组件的预览是不是一份自解释的、能操作的界面。
+ */
+const isInteractive = computed(() => def.value?.interactive === true)
+
+/**
  * 实时预览的全部绑定。
  *
- * `preview` 只传给声明了它的组件（目前只有搜索），不无条件写上：
+ * `preview` 只传给声明了它的组件（可交互的那些），不无条件写上：
  * 不认识这个 prop 的组件会把它落成 DOM 属性（preview=""），
  * 与 TileWidget 里对 spanW / spanH 的处理是同一条理由。
  */
@@ -144,30 +250,23 @@ const previewBindings = computed(() => ({
   ...previewProps.value,
   spanW: Number(spanW.value),
   spanH: Number(spanH.value),
-  ...(props.tile.widgetId === 'search' ? { preview: true } : {}),
+  ...(isInteractive.value ? { preview: true } : {}),
 }))
 
-/**
- * 预览的缩放方式。
- *
- * 判据挂在 widgetId 上而不是给 WidgetDef 加一个 `previewMode` 字段：
- * 目前只此一例，加字段就要在注册表里让每个组件都回答一次这个问题。
- * 第二个需要 zoom 的组件出现时再抽。
- */
-const previewMode = computed<'fit' | 'zoom'>(() =>
-  props.tile.widgetId === 'search' ? 'zoom' : 'fit',
-)
+/** 预览的缩放方式：可交互组件按真实尺寸 zoom，其余 fit */
+const previewMode = computed<'fit' | 'zoom'>(() => (isInteractive.value ? 'zoom' : 'fit'))
 
 /**
  * 预览旁的说明文字；返回空串即不渲染。
  *
- * 搜索方块不给——它的预览是一个写着「用百度搜索」的输入框，已经自解释，
- * 再挂一句注册表里的卡片描述是重复，而且会挤掉预览的宽度（那一档正靠宽度
- * 说明尺寸）。未知组件反过来必须留：此时预览只是个「?」。
+ * 可交互组件不给——搜索的预览是一个写着「用百度搜索」的输入框、待办的预览是一份
+ * 真实清单加一行输入框，都已经自解释，再挂一句注册表里的卡片描述是重复，
+ * 而且会挤掉预览的宽度（那一档正靠宽度说明尺寸）。
+ * 未知组件反过来必须留：此时预览只是个「?」。
  */
 const previewHint = computed(() => {
   if (!def.value) return `未知组件：${props.tile.widgetId}`
-  return props.tile.widgetId === 'search' ? '' : def.value.desc
+  return isInteractive.value ? '' : def.value.desc
 })
 
 function onSubmit() {
@@ -177,7 +276,8 @@ function onSubmit() {
    */
   emit('submit', {
     kind: 'widget',
-    name: props.tile.name,
+    // trim 后可能是空串，这是合法值（不渲染名称行），不要在这里兜回默认名
+    name: name.value.trim(),
     widgetId: props.tile.widgetId,
     spanW: Number(spanW.value),
     spanH: Number(spanH.value),
@@ -199,12 +299,15 @@ function onSubmit() {
       - 搜索走 zoom——它的输入框高度、字号、圆角都是 clamp() 出来的绝对值，
         fit 模式下不会跟着缩，2×1 与 6×2 的预览会长得一模一样。
 
-      组件本身不预览名称行（桌面上组件方块也只画内容），故不传 label。
+      名称行跟着一起预览：它是可编辑项，而「留空则方格长到名称处」这条规则
+      只有在预览里能同时看到两种高度才说得清——清空名称时方格当场变高，
+      比在提示语里描述有效得多。
     -->
     <div class="preview" :class="{ 'is-zoom': previewMode === 'zoom' }">
       <TilePreview
         :span-w="Number(spanW)"
         :span-h="Number(spanH)"
+        :label="previewLabel"
         :mode="previewMode"
       >
         <component :is="def.component" v-if="def" v-bind="previewBindings" />
@@ -222,6 +325,28 @@ function onSubmit() {
       -->
       <span v-if="previewHint" class="preview__hint">{{ previewHint }}</span>
     </div>
+
+    <!--
+      名称排在最前：它是所有组件共有的字段，而下面几项各只对一种组件出现。
+
+      允许留空，所以不带 required 也不显示报错；留空后的效果由下面那句
+      随空值出现的提示说明，配合预览里当场变高的方格。
+    -->
+    <label class="field">
+      <span class="field__label">
+        名称
+        <span class="field__hint" :class="{ 'is-over': nameLeft < 0 }">
+          可留空，建议 {{ NAME_MAX }} 字内
+        </span>
+      </span>
+      <input
+        v-model="name"
+        class="field__input"
+        type="text"
+        :placeholder="def ? def.name : '组件名称'"
+      />
+      <span v-if="!name.trim()" class="field__note">留空时方格会长到名称处</span>
+    </label>
 
     <!--
       引擎排在尺寸之上，与天气的地点同一个位置：它是搜索方块唯一真正的配置项，
@@ -257,6 +382,22 @@ function onSubmit() {
       />
     </div>
 
+    <!--
+      目标日期排在尺寸之上，与天气的地点、搜索的引擎同一个位置：
+      它是倒计时方块唯一的必填项，而尺寸与颜色都有可用的默认值。
+    -->
+    <div v-if="dateField" class="field">
+      <span class="field__label">
+        目标日期
+        <span class="field__hint">按天计算，跨零点自动更新</span>
+      </span>
+      <DateField
+        :target-date="date.targetDate"
+        :repeat-yearly="date.repeatYearly"
+        @update="date = $event"
+      />
+    </div>
+
     <div class="field">
       <span class="field__label">
         尺寸
@@ -280,6 +421,26 @@ function onSubmit() {
         :palette="field.palette"
       />
     </div>
+
+    <!--
+      自定义装饰折叠面板，放在颜色之后、提交按钮之前。
+
+      它们是附加的装饰功能，不配也完整，所以折叠起来避免拉长常规配置区。
+      只有倒计时组件有这一段（hasCustom 读 widgetFieldByKind(..., 'custom')）。
+    -->
+    <CustomPanel
+      v-if="hasCustom"
+      :custom-text="custom.customText"
+      :custom-text-color="custom.customTextColor"
+      :custom-text-size="custom.customTextSize"
+      :custom-text-weight="custom.customTextWeight"
+      :custom-image-source="custom.customImageSource"
+      :custom-image-url="custom.customImageUrl"
+      :custom-image-data="custom.customImageData"
+      :span-w="Number(spanW)"
+      :span-h="Number(spanH)"
+      @update="custom = $event"
+    />
 
     <button class="submit" type="submit">保存修改</button>
   </form>
@@ -349,6 +510,37 @@ function onSubmit() {
 }
 
 .field__hint {
+  color: var(--color-text-dim);
+  font-size: var(--fs-sm);
+}
+
+/* 超出软上限：与 TabCustom 同一套表现，只是这里没有硬校验 */
+.field__hint.is-over {
+  color: var(--danger);
+}
+
+/* 与 TabCustom 的 .field__input 逐条一致：同一种输入框不该有两套观感 */
+.field__input {
+  min-width: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--fill);
+  font-size: var(--fs-base);
+  transition: border-color var(--dur-fast) var(--ease);
+}
+
+.field__input:focus {
+  border-color: var(--focus);
+  outline: none;
+}
+
+/*
+ * 留空时的说明，占 TabCustom 里报错那一行的位置。
+ *
+ * 用 --color-text-dim 而不是 --danger：空名称是一种合法选择，不是错误。
+ */
+.field__note {
   color: var(--color-text-dim);
   font-size: var(--fs-sm);
 }

@@ -30,10 +30,35 @@ function loadRatio(): number {
   }
 }
 
+/**
+ * 手柄的纵向位置，**模块级**。
+ *
+ * 提到模块级是为了让「重置为默认」能改到它：设置抽屉里那个按钮拿不到
+ * SettingsHandle 组件内部的 ref，而停靠侧（归 settings store）已经会被重置——
+ * 只重置左右不重置高度，会出现「手柄跳回右边但仍停在上次拖到的高度」。
+ *
+ * 组件里只有一处调用，所以提出来没有任何行为变化；这也与 useTodos /
+ * useSearchHistory 的模块级共享同一手法。
+ */
+const ratio = ref(loadRatio())
+
+function persistRatio() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ratio: ratio.value }))
+  } catch {
+    // 存储不可用（隐私模式 / 配额）时静默降级为内存状态
+  }
+}
+
+/** 重置纵向位置，供设置里的「重置为默认」调用；停靠侧由 settings.reset 一并管 */
+export function resetEdgeHandle() {
+  ratio.value = DEFAULT_RATIO
+  persistRatio()
+}
+
 export function useEdgeHandle() {
   const settings = useSettingsStore()
 
-  const ratio = ref(loadRatio())
   const isDragging = ref(false)
 
   /** 停靠侧是设置项，拖动手柄与抽屉里的切换器改的是同一个值 */
@@ -47,14 +72,6 @@ export function useEdgeHandle() {
   let rafId: number | null = null
   /** 拖拽结束后紧随的原生 click 需要被丢弃，否则松手即打开抽屉 */
   let dragged = false
-
-  function persist() {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ratio: ratio.value }))
-    } catch {
-      // 存储不可用（隐私模式 / 配额）时静默降级为内存状态
-    }
-  }
 
   /** 只停靠左右两边：横向取较近的一侧，纵向位置直接跟随指针 */
   function follow(clientX: number, clientY: number) {
@@ -120,7 +137,7 @@ export function useEdgeHandle() {
     // 最后一帧可能还在等 rAF，直接按松手位置定位，避免停在上一帧的边
     if (wasDragging) follow(event.clientX, event.clientY)
     release()
-    if (wasDragging) persist()
+    if (wasDragging) persistRatio()
   }
 
   function onPointerCancel() {

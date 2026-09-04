@@ -151,8 +151,38 @@ input {
    * 压暗一档后是 5.1:1。两者同色相，观感上是同一个颜色的深浅。
    */
   --focus: rgb(237 237 240 / 0.7);
-  --accent: #5b7cfa;
-  --accent-solid: #4459cc;
+
+  /*
+   * --theme-color 是主题色的唯一入口，由 settings store 写成 <html> 行内变量
+   * （与 --scrim-opacity 同构）。这里的默认值必须与 **DEFAULTS.themeColor**
+   * （即 THEME_PRESETS[1]，湖蓝）一致：JS 未执行时（首帧 / 脚本失败）靠它兜住，
+   * 不一致的表现是首帧闪一下另一个色相再跳成正确的。
+   */
+  --theme-color: #558aaf;
+
+  --accent: var(--theme-color);
+  /*
+   * 这里给的是**字面兜底值**，对应默认主题色；真正的派生在文件末尾的
+   * @supports (color-mix) 块里。
+   *
+   * 不在这里直接写 color-mix：不支持的浏览器上它会让这个自定义属性
+   * 在计算值阶段失效（guaranteed-invalid），于是 `background: var(--accent-solid)`
+   * 整条被当作 unset——提交按钮会直接没有底色，而不是「颜色不对」。
+   *
+   * 值 = color-mix(in srgb, #558aaf 78%, #000) 的算术结果，逐字算过。
+   * 实测 --color-text 压在它上面是 4.81:1，过正文的 4.5:1（三条约束见
+   * stores/settings 的 THEME_PRESETS）；改默认主题色时这个数必须跟着重算。
+   */
+  --accent-solid: #426c89;
+
+  /*
+   * Tab 滑块 / 分段控件滑块的浮起面。
+   *
+   * 单独一个令牌而不是直接染 --fill-raised：后者还被按钮、方格悬停态等
+   * 一大批浮起面共用，染下去等于全局上色，远超「Tab 的颜色」这个范围。
+   * 默认与 --fill-raised 完全相同，染色在下面的 @supports 块里给。
+   */
+  --thumb-raised: var(--fill-raised);
 
   /* 危险动作（删除）：在深色面板上对比度 > 4.5:1 */
   --danger: #fca5a5;
@@ -175,6 +205,12 @@ input {
    */
   --z-suggest: 950;
   --z-engine-menu: 950;
+  /*
+   * 名称截断提示与搜索弹层同档：它只在悬停网格时出现，
+   * 比 --z-dialog / --z-drawer 低是刻意的——那两者是模态，遮罩一盖上指针就离开了方格，
+   * 提示自然已经收起；比 --z-menu 低也是刻意的，右键菜单可能正压在名称上。
+   */
+  --z-tip: 950;
   --z-dialog: 1000;
   --z-drawer: 1100;
   /* 菜单在最上层：它随时可被任意浮层打断，显示期间不该被任何东西盖住 */
@@ -243,13 +279,24 @@ input {
   /* 建议列表与右键菜单同一档：两者都是贴着触发元素展开的轻量浮层 */
   --bg-search: rgb(28 28 33 / 0.94);
 
-  /* 遮罩压暗层：不透明度由设置里的滑块写成行内 --scrim-opacity */
-  --scrim-tint: rgb(6 6 8 / var(--scrim-opacity, 0.42));
-  --overlay-tint: rgb(6 6 8 / var(--scrim-opacity, 0.42));
+  /*
+   * 遮罩压暗层：不透明度由设置里的滑块写成行内 --scrim-opacity。
+   *
+   * var() 的兜底值只在 JS 未执行时用到，取 0.2 与 DEFAULTS.scrimOpacity
+   * （SCRIM_OPACITY_MIN）一致，理由同 --theme-color 那处。
+   */
+  --scrim-tint: rgb(6 6 8 / var(--scrim-opacity, 0.2));
+  --overlay-tint: rgb(6 6 8 / var(--scrim-opacity, 0.2));
 
   /* 动效 */
   --dur-fast: 140ms;
   --dur-base: 240ms;
+  /*
+   * 背景交叉淡入。远长于 --dur-base：换背景是整屏面积的变化，
+   * 240ms 会读作「跳」而不是「渐变」，接近 1 秒才显得从容。
+   * AppBackground 会读回这个值来定清理时机，改动即同步生效。
+   */
+  --dur-bg: 800ms;
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
 
 
@@ -331,3 +378,63 @@ html[data-glass='off'] {
   }
 }
 
+
+/* ── 主题色派生 ──────────────────────────────────────────
+ *
+ * 唯一输入是 --theme-color（settings store 写在 <html> 行内）。
+ * 这一块整体包在 @supports 里：不支持 color-mix 的浏览器（Chrome <111 /
+ * Safari <16.2 / Firefox <113）保持上面那组字面兜底值，也就是今天的无色相观感。
+ * 降级结果是「少了面板淡染」，而不是「跳回旧配色」或「某处没有底色」。
+ *
+ * 放在文件末尾是刻意的：
+ *  - 要覆写 :root 里的字面兜底值，同特异度靠后来者胜出；
+ *  - 要排在 html[data-glass='off'] 与 prefers-reduced-transparency 两块之后。
+ *    那两块把 --bg-* 指向 --surface-*，所以只染 --surface-* 就自动流到两个
+ *    降级分支里，不必逐个去改那 7 个玻璃面（漏一处只在那个环境露馅）。
+ *    它们的特异度（0,1,1）高于这里的 :root（0,1,0），关磨砂时仍由它们说了算。
+ */
+@supports (color: color-mix(in srgb, red, blue)) {
+  :root {
+    /* 文字压在色块上专用，压暗一档；比例见 :root 里的说明 */
+    --accent-solid: color-mix(in srgb, var(--theme-color) 78%, #000);
+
+    /*
+     * 面板三档掺 6% 主题色。
+     *
+     * 6% 是「并排比较才看得出偏向、单看仍读作灰」的量级——与 BG_PRESETS 后五档
+     * 把饱和度压到 5% 上下是同一手法。明度差仍由原令牌承担，染色不改明度关系，
+     * 所以三档之间的层次、以及浅字对底的对比度都不受影响。
+     */
+    --surface-1: color-mix(in srgb, #17171b 94%, var(--theme-color));
+    --surface-2: color-mix(in srgb, #1a1a1f 94%, var(--theme-color));
+    --surface-3: color-mix(in srgb, #1c1c21 94%, var(--theme-color));
+
+    /*
+     * 开磨砂档的浮层底色，同样 6%。
+     *
+     * 这几个是半透明值，而主题色不透明，混合后 alpha 会从 0.92 抬到约 0.925
+     * （srgb 预乘混合下 alpha 也按权重取平均）。0.005 的差异在任何背景上都看不出，
+     * 换取的是「一处比例、六个面一致」——逐个手写不透明版本才是真的会漏。
+     */
+    --bg-drawer: color-mix(in srgb, rgb(23 23 27 / 0.92) 94%, var(--theme-color));
+    --bg-panel: color-mix(in srgb, rgb(26 26 31 / 0.92) 94%, var(--theme-color));
+    --bg-menu: color-mix(in srgb, rgb(28 28 33 / 0.94) 94%, var(--theme-color));
+    --bg-toast: color-mix(in srgb, rgb(28 28 33 / 0.94) 94%, var(--theme-color));
+    --bg-handle: color-mix(in srgb, rgb(28 28 33 / 0.85) 94%, var(--theme-color));
+    --bg-search: color-mix(in srgb, rgb(28 28 33 / 0.94) 94%, var(--theme-color));
+
+    /*
+     * Tab / 分段控件的滑块。
+     *
+     * 写成「主题色 + transparent」而不是混 --fill-raised：后者是半透明白
+     * （alpha 0.1），与不透明的主题色相混时 alpha 会被抬到 0.3 以上，
+     * 「掺多少色」和「变多实」两件事纠缠在一起，调不准。
+     * 直接给主题色一个固定 alpha，落在深色面板上就是一块淡染玻璃，
+     * 比原来的 0.1 白更显眼——这正是「当前 Tab」需要的。
+     *
+     * 28% 而非更高：滑块上压着 --color-text 的 Tab 文字，太实会把它逼到
+     * 对比度边缘（--accent 满色上只有 3.2:1，达不到正文 4.5:1）。
+     */
+    --thumb-raised: color-mix(in srgb, var(--theme-color) 28%, transparent);
+  }
+}

@@ -5,8 +5,10 @@ import ContextMenu from './ContextMenu.vue'
 import DragLayer from './DragLayer.vue'
 import OverlayLayer from './OverlayLayer.vue'
 import TileCell from './TileCell.vue'
+import TileNameTip from './TileNameTip.vue'
 import UndoToast from './UndoToast.vue'
 import AddTileDialog from './dialog/AddTileDialog.vue'
+import TodoDialog from './dialog/TodoDialog.vue'
 import { useContextMenu, type MenuItem } from '@/composables/useContextMenu'
 import { gridGeometry } from '@/composables/useAreaViewport'
 import { useDragSort } from '@/composables/useDragSort'
@@ -96,6 +98,15 @@ const editingTile = ref<Tile | undefined>(undefined)
 let lastTrigger: HTMLElement | null = null
 
 /**
+ * 完整待办对话框是否打开。
+ *
+ * 布尔而非「目标槽位」：它展示的是模块级共享的那一份清单（见 useTodos），
+ * 与哪一格无关——从 1×1 那格打开和从 3×4 那格打开，看到的是同一个东西。
+ * 宿主在这里而不在方块里，所以桌面上放几个待办方块都只有一个对话框。
+ */
+const todoDialogOpen = ref(false)
+
+/**
  * 浮层展示的内容在拖拽激活时快照。
  * 落位阶段 store 已提交交换，slots[from] 已换成另一个方块，
  * 若浮层直接读 store，飞行中的内容会突变。
@@ -161,7 +172,11 @@ const dropHint = computed(() => {
   const tile = store.slots[from]
   if (!tile) return null
   const span = tileSpan(tile)
-  return store.resolvePlacement(to, span.w, span.h)
+  /*
+   * nameless 一起带出来：没起名的方块落位后方格会长到名称处（见 TileCell 的
+   * --label-block），指示框不跟着长就会比真实落点矮一截。
+   */
+  return { ...store.resolvePlacement(to, span.w, span.h), nameless: tile.name.trim() === '' }
 })
 
 /* ── 右键菜单 ─────────────────────────────────────── */
@@ -282,7 +297,46 @@ function activate(index: number) {
   if (tile.kind === 'link') {
     window.open(tile.url, '_blank', 'noopener,noreferrer')
   }
-  // widget 的自身行为留待组件功能落地
+  /*
+   * widget 不在这里分发自身行为。
+   *
+   * 待办的「点方块打开完整清单」走 open-widget-dialog 那条独立通路，理由是
+   * **哪些形状可点是组件自己的知识**（宽=1 的四档没有内部控件才可整块点，
+   * 见 todo/variant.opensOnTileClick）。在这里按 widgetId 分发就等于把那份判据
+   * 抄到网格层，而网格层拿不到版式。
+   */
+}
+
+/**
+ * 组件方块请求打开自己的功能对话框。
+ *
+ * 目前只有待办。按 widgetId 分发而不是让组件直接指定要开哪个对话框：
+ * 对话框是网格层的资产，组件只上报「我要打开我的那个」。
+ */
+function openWidgetDialog(index: number) {
+  const tile = store.slots[index]
+  if (tile?.kind !== 'widget') return
+  if (tile.widgetId !== 'todo') return
+
+  /*
+   * 焦点归还的目标是那一格里的**入口按钮**，不是方格本身。
+   *
+   * 方格根节点对 interactive 方块没有 tabindex（TileCell 把 role / tabindex 都置为
+   * undefined，焦点顺序交给内部控件），focus() 到一个不可聚焦的元素是空操作——
+   * TodoWidget.onInputEscape 的注释已经踩过同一个坑，这里实测也是：关闭后
+   * activeElement 落回 body。待办方块恒有一个入口按钮（.td__openKey 或 .td__enter），
+   * 它正是用户点的那个东西，也就是焦点该回去的地方。
+   */
+  const square = cellRefs.value[index]?.squareEl ?? null
+  lastTrigger = square?.querySelector<HTMLElement>('.td__openKey, .td__enter') ?? square
+  todoDialogOpen.value = true
+}
+
+/** 关闭完整待办对话框，焦点还回入口按钮（与 closeDialog 同一条纪律） */
+function closeTodoDialog() {
+  todoDialogOpen.value = false
+  if (lastTrigger?.isConnected) lastTrigger.focus()
+  lastTrigger = null
 }
 
 /**
@@ -345,6 +399,38 @@ watch(
 )
 
 const undoMessage = computed(() => `已删除「${undo.value?.tile.name ?? ''}」`)
+
+/* ── 名称截断提示 ─────────────────────────────────── */
+
+/**
+ * 悬停在被截断的名称上时显示完整名称；null 表示不显示。
+ *
+ * 所有格共用这一份状态、渲染成一个浮层：提示要盖过相邻方格，
+ * 挂在格内会被滚动容器裁掉。同时天然保证只有一个提示同时存在。
+ */
+const nameTip = ref<{ text: string; x: number; top: number; bottom: number } | null>(null)
+
+/**
+ * 拖拽一开始就撤掉提示。
+ *
+ * 光靠名称行的 pointerdown 不够：拖起来之后指针早已离开原来那一格，
+ * 而拖拽期间指针被 setPointerCapture 接管，pointerleave 不会照常派发。
+ */
+watch(drag.isActive, (active) => {
+  if (active) nameTip.value = null
+})
+
+/**
+ * 网格滚动 / 拖拽刷新矩形时的收尾。
+ *
+ * 提示位置是按进入那一刻的矩形算定的，滚动后锚点已经跑了；
+ * 跟着重新定位不合适——名称行可能已经滚出可视区，提示却还悬在原处，
+ * 所以直接收起，指针再动一次自会重新触发。
+ */
+function onGridScroll() {
+  drag.refreshRects()
+  nameTip.value = null
+}
 </script>
 
 <template>
@@ -358,7 +444,7 @@ const undoMessage = computed(() => `已删除「${undo.value?.tile.name ?? ''}�
       滚动条会计入 getBoundingClientRect，一出现就少量一点尺寸，
       于是反解出的列数减一、网格变窄、滚动条又消失——一帧一变的抖动。
     -->
-    <div ref="scrollEl" class="grid-scroll" @wheel="onWheel" @scroll.passive="drag.refreshRects()">
+    <div ref="scrollEl" class="grid-scroll" @wheel="onWheel" @scroll.passive="onGridScroll">
       <div ref="gridEl" class="grid" :style="{ '--grid-cols': store.cols, ...areaStyle }">
         <TileCell
           v-for="cell in cells"
@@ -375,12 +461,17 @@ const undoMessage = computed(() => `已删除「${undo.value?.tile.name ?? ''}�
           :is-source="drag.isDragging.value && drag.fromIndex.value === cell.index"
           :is-landing="drag.isSettling.value && drag.settleIndex.value === cell.index"
           :is-menu-target="menu.open.value && menuIndex === cell.index"
-          @pointerdown="(event, el) => drag.onPointerDown(event, { index: cell.index, el })"
+          @pointerdown="
+            (event, el, deferCapture) =>
+              drag.onPointerDown(event, { index: cell.index, el, deferCapture })
+          "
           @pointermove="(event, el) => drag.onPointerMove(event, { index: cell.index, el })"
           @pointerup="(event, el) => drag.onPointerUp(event, { index: cell.index, el })"
           @pointercancel="drag.onPointerCancel()"
           @activate="activate"
           @update-props="onWidgetProps"
+          @open-widget-dialog="openWidgetDialog"
+          @name-tip="nameTip = $event"
         />
 
         <!-- 落点指示：独立一层，用显式定位画出夹紧后的完整落点区域 -->
@@ -391,6 +482,7 @@ const undoMessage = computed(() => `已删除「${undo.value?.tile.name ?? ''}�
             gridColumn: `${dropHint.col + 1} / span ${dropHint.w}`,
             gridRow: `${dropHint.row + 1} / span ${dropHint.h}`,
             '--span-h': dropHint.h,
+            ...(dropHint.nameless ? { '--label-block': '0px' } : {}),
           }"
           aria-hidden="true"
         />
@@ -423,6 +515,15 @@ const undoMessage = computed(() => `已删除「${undo.value?.tile.name ?? ''}�
       />
     </OverlayLayer>
 
+    <!--
+      完整待办对话框。与 AddTileDialog 同一档 z-index（--z-dialog），两者不会同时
+      在场：打开这个的入口是方块自身，而那个由右键菜单 / 空格点击触发。
+      transition 同样挂在遮罩的后代上，所以要显式给 duration。
+    -->
+    <OverlayLayer name="todo-dialog" duration="base">
+      <TodoDialog v-if="todoDialogOpen" @close="closeTodoDialog" />
+    </OverlayLayer>
+
     <OverlayLayer name="menu">
       <ContextMenu
         v-if="menu.open.value"
@@ -431,6 +532,17 @@ const undoMessage = computed(() => `已删除「${undo.value?.tile.name ?? ''}�
         :items="menu.items.value"
         @select="onMenuSelect"
         @close="menu.close()"
+      />
+    </OverlayLayer>
+
+    <!-- 名称被截断时的完整名称提示，全网格共用一个实例 -->
+    <OverlayLayer name="tip">
+      <TileNameTip
+        v-if="nameTip"
+        :text="nameTip.text"
+        :x="nameTip.x"
+        :top="nameTip.top"
+        :bottom="nameTip.bottom"
       />
     </OverlayLayer>
 
@@ -545,11 +657,12 @@ const undoMessage = computed(() => `已删除「${undo.value?.tile.name ?? ''}�
 .drop-hint {
   --span-w: 1;
   --span-h: 1;
+  /* 与 TileCell 同名同义：没起名的方块落位后会长到名称处，指示框要跟着一起长 */
+  --label-block: calc(var(--label-gap) + var(--label-height));
   --cell-block: calc(var(--tile-size) + var(--label-gap) + var(--label-height));
   align-self: start;
   height: calc(
-    var(--cell-block) * var(--span-h) + var(--gap) * (var(--span-h) - 1) - var(--label-gap) -
-      var(--label-height)
+    var(--cell-block) * var(--span-h) + var(--gap) * (var(--span-h) - 1) - var(--label-block)
   );
   border: 1px solid var(--accent);
   border-radius: calc(var(--tile-size) * var(--tile-radius-ratio));

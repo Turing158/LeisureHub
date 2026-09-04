@@ -46,7 +46,7 @@ const LABEL_GAP = 4
 
 const props = withDefaults(
   defineProps<{
-    /** 占格宽 / 高；范围随内容种类不同（链接 1..4，搜索宽到 6），这里只按数值缩放 */
+    /** 占格宽 / 高；范围随内容种类不同（链接 1..4，搜索宽到当前网格列数），这里只按数值缩放 */
     spanW: number
     spanH: number
     /** 传入即在方格下方预览名称行；不传则只画方格 */
@@ -83,9 +83,15 @@ const factors = computed(() => {
   const w = props.spanW
   const h = props.spanH
   const cellK = 1 + LABEL_GAP_K + LABEL_HEIGHT_K
+  /*
+   * 没有名称行时那段高度归方格，与 TileCell 的 --label-block 置 0 同一条规则：
+   * 单元格的外部尺寸不变，收的是内部划分。少了这一支，无名方块的预览会比
+   * 桌面上矮一截，而「留空则方格长到名称处」正是要靠预览看出来的。
+   */
+  const labelK = hasLabel.value ? LABEL_GAP_K + LABEL_HEIGHT_K : 0
   return {
     w: w + GAP_K * (w - 1),
-    h: cellK * h + GAP_K * (h - 1) - LABEL_GAP_K - LABEL_HEIGHT_K,
+    h: cellK * h + GAP_K * (h - 1) - labelK,
   }
 })
 
@@ -137,9 +143,14 @@ const stageVars = { '--stage-w': `${STAGE_W}px`, '--stage-h': `${STAGE_H}px` }
 const realSize = computed(() => {
   const { gap, cellW, cellH } = gridGeometry.value
   const labelBlock = cellH - cellW
+  const box = cellExtent(props.spanH, cellH, gap)
   return {
     w: cellExtent(props.spanW, cellW, gap),
-    h: cellExtent(props.spanH, cellH, gap) - labelBlock,
+    /** 方格本身的高度：有名称行时让出那一段，没有则吃满 */
+    square: hasLabel.value ? box - labelBlock : box,
+    /** 连名称行一起的总高度，即这一格在桌面上的纵向占位 */
+    box,
+    labelBlock,
   }
 })
 
@@ -167,7 +178,7 @@ onBeforeUnmount(() => {
  *
  * **上限是 1，绝不放大超过真实尺寸。** 把 2 格宽（170px）撑满 496px 的容器，
  * 12.75px 的字会渲染成 37px——那不再是「落格后长什么样」，而是一张放大镜下的照片。
- * 封在 1 以内后，预览会随尺寸档位从 170px 长到 550px，这正是「按比例缩放」
+ * 封在 1 以内后，预览会随尺寸档位从 170px 长到一整行（8 列网格是 740px），这正是「按比例缩放」
  * 要给出的信息：它在桌面上有多大。
  *
  * 量不到宽度（首帧）时按 1 走：随后 ResizeObserver 会立刻修正，
@@ -178,10 +189,15 @@ const zoom = computed(() => {
   return Math.min(1, roomW.value / realSize.value.w)
 })
 
-/** 缩放后的实际占位尺寸；transform 不参与布局，得由外层显式收出这个盒子 */
+/**
+ * 缩放后的实际占位尺寸；transform 不参与布局，得由外层显式收出这个盒子。
+ *
+ * 高度取 box 而不是 square：这一档现在也画名称行，盒子要连它一起收进去，
+ * 否则名称会溢出到下面的表单上（.zoom__box 有 overflow: hidden，实际是被切掉）。
+ */
 const zoomBoxStyle = computed(() => ({
   width: `${Math.round(realSize.value.w * zoom.value)}px`,
-  height: `${Math.round(realSize.value.h * zoom.value)}px`,
+  height: `${Math.round(realSize.value.box * zoom.value)}px`,
 }))
 
 /**
@@ -190,17 +206,17 @@ const zoomBoxStyle = computed(() => ({
  * 这样字号、描边、内边距、圆角全部跟着一起缩——SearchWidget 的输入框高度与
  * 字号都是 clamp() 出来的绝对值，只缩 --tile-size 的话它们不会动。
  *
- * transform-origin 取 top left，**不是 center**：内层往往比外层宽（6 格是 550px，
+ * transform-origin 取 top left，**不是 center**：内层往往比外层宽（宽档位可到一整行，8 列网格是 740px，
  * 而窄面板里只有 284px 可用），此时 `margin-inline: auto` 解析为 0、
  * 绕中心缩放会把结果整体推到右边并被裁掉。从左上角缩，缩完正好落在
  * 上面那个 zoomBox 里，居中由 zoomBox 自己（margin-inline: auto）负责。
  */
 const zoomInnerStyle = computed(() => ({
   width: `${realSize.value.w}px`,
-  height: `${realSize.value.h}px`,
+  height: `${realSize.value.box}px`,
   '--square-w': `${realSize.value.w}px`,
-  '--square-h': `${realSize.value.h}px`,
-  '--content-size': `${Math.min(realSize.value.w, realSize.value.h)}px`,
+  '--square-h': `${realSize.value.square}px`,
+  '--content-size': `${Math.min(realSize.value.w, realSize.value.square)}px`,
   transform: `scale(${zoom.value})`,
 }))
 
@@ -223,7 +239,10 @@ watch(realSize, () => {
   <span v-if="mode === 'zoom'" ref="rootEl" class="zoom">
     <span class="zoom__box" :style="zoomBoxStyle">
       <span class="zoom__inner" :style="zoomInnerStyle">
-        <slot />
+        <span class="zoom__square">
+          <slot />
+        </span>
+        <span v-if="hasLabel" class="zoom__label">{{ label }}</span>
       </span>
     </span>
   </span>
@@ -264,21 +283,58 @@ watch(realSize, () => {
 }
 
 /*
- * 方块本体，用真实令牌搭出来，只有 transform 在缩。
+ * 一整格（方格 + 名称行），用真实令牌搭出来，只有 transform 在缩。
+ *
+ * transform-origin 取 top left，理由见 zoomInnerStyle 的注释。
+ * 竖排 + --label-gap 与 TileCell 的 .tile-cell 同构，名称行的位置才一致。
+ */
+.zoom__inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--label-gap);
+  transform-origin: top left;
+}
+
+/*
+ * 方格本体。
  *
  * 边框与圆角逐条对齐 TileCell__square，包括那条「按短边取等半径再夹上限」的
  * 圆角公式；--tile-radius-max 不覆写，直接吃 :root 的 26px，因为这一档没有缩令牌
  * ——它和其它绝对尺寸一样由 transform 一并缩掉。
  *
- * transform-origin 取 top left，理由见 zoomInnerStyle 的注释。
+ * 高度必须写死 --square-h：内容（搜索的输入框）是 clamp() 出来的绝对高度，
+ * 不写的话 flex 项会被内容顶大，方格就不再是它在桌面上的高度了。
  */
-.zoom__inner {
+.zoom__square {
   display: block;
+  width: var(--square-w);
+  height: var(--square-h);
+  flex: 0 0 auto;
   overflow: hidden;
   border: 1px solid var(--tile-border);
   border-radius: min(calc(var(--content-size) * var(--tile-radius-ratio)), var(--tile-radius-max));
   background: var(--tile-bg);
-  transform-origin: top left;
+}
+
+/*
+ * 名称行，逐条对齐 TileCell__label（含那道投影）。
+ *
+ * 字号用 --fs-base 而不是 fit 模式那档的 --fs-sm：这一档是等比照片，
+ * 桌面上的名称就是 --fs-base，而整体缩放由 transform 负责。
+ */
+.zoom__label {
+  width: var(--square-w);
+  height: var(--label-height);
+  flex: 0 0 auto;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: var(--fs-base);
+  line-height: var(--label-height);
+  text-align: center;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 3px rgb(0 0 0 / 0.55);
+  white-space: nowrap;
 }
 
 /* ── fit 模式 ────────────────────────────────────────── */

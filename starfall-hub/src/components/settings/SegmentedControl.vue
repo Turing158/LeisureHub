@@ -105,7 +105,8 @@ watch(
   bottom: var(--seg-inset);
   left: var(--seg-inset);
   border-radius: var(--r-sm);
-  background: var(--fill-raised);
+  /* --thumb-raised 带主题色淡染，默认档等同 --fill-raised；见 style.css 的说明 */
+  background: var(--thumb-raised);
   box-shadow: var(--shadow-sm);
   transition: transform var(--dur-base) var(--ease);
 }

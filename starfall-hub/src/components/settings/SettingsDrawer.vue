@@ -2,21 +2,33 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 
 import OverlayLayer from '../OverlayLayer.vue'
+import ColorPicker from '../dialog/ColorPicker.vue'
+import ConfirmDialog from '../dialog/ConfirmDialog.vue'
 import CustomEngines from './CustomEngines.vue'
 import NumberField from './NumberField.vue'
 import SegmentedControl from './SegmentedControl.vue'
 import ToggleSwitch from './ToggleSwitch.vue'
 import { autoFit } from '@/composables/useAreaViewport'
-import { useSearchHistory } from '@/composables/useSearchHistory'
+import { resetEdgeHandle } from '@/composables/useEdgeHandle'
+import { resetSearchHistory, useSearchHistory } from '@/composables/useSearchHistory'
+import { resetTodos } from '@/composables/useTodos'
+import { clearWeatherCache } from '../widgets/weather/cache'
+import { useGridStore } from '@/stores/grid'
 import {
   AREA_CELL_MAX,
   AREA_CELL_MIN,
   AREA_SIZE_MAX,
   AREA_SIZE_MIN,
+  BG_COLOR_MAX,
+  BG_IMAGE_MAX,
+  BG_INTERVAL_MAX,
+  BG_INTERVAL_MIN,
   BG_PRESETS,
   BLUR_MAX,
+  LOCAL_IMAGE_MAX_BYTES,
   SCRIM_OPACITY_MAX,
   SCRIM_OPACITY_MIN,
+  THEME_PRESETS,
   useSettingsStore,
   type AreaMode,
   type BgMode,
@@ -24,12 +36,20 @@ import {
   type GlassMode,
   type MotionMode,
 } from '@/stores/settings'
+import { normalizeHex } from '@/utils/color'
 
 const emit = defineEmits<{ close: [] }>()
 
 const props = defineProps<{ open: boolean }>()
 
 const settings = useSettingsStore()
+/**
+ * 方块布局。
+ *
+ * 抽屉平时不碰网格，只有「重置为默认」要一并把布局换回去——那是用户按下那个
+ * 按钮时期待的完整结果（布局 + 设置 + 数据），少了任何一样都会让人以为没生效。
+ */
+const grid = useGridStore()
 /**
  * 搜索记录。
  *
@@ -42,7 +62,8 @@ const side = computed(() => settings.drawerSide)
 
 const BG_MODE_OPTIONS: { value: BgMode; label: string }[] = [
   { value: 'color', label: '纯色' },
-  { value: 'image', label: '图片' },
+  { value: 'local', label: '本地图片' },
+  { value: 'image', label: '网络图片' },
 ]
 
 const MOTION_OPTIONS: { value: MotionMode; label: string }[] = [
@@ -78,110 +99,389 @@ function fillCellsFromViewport() {
   settings.setAreaRows(autoFit.value.rows)
 }
 
-/** 图片地址本地暂存：输入过程中不写 store，避免每敲一个字符都触发一次背景请求 */
-const imageDraft = ref(settings.bgImage)
-const imageError = ref('')
+/* ── 轮换 ─────────────────────────────────── */
 
 /**
- * 背景图的加载状态。
+ * 轮换开关与间隔按档读写。
+ *
+ * 三档各有一套设置（见 store 的 DEFAULTS.bgRotate），所以这里一律带上
+ * 当前档；写死某一档会让另外两档的开关互相串台。
+ */
+const rotateOn = computed(() => settings.bgRotate[settings.bgMode])
+const rotateInterval = computed(() => settings.bgInterval[settings.bgMode])
+
+/**
+ * 纯色档能不能多选，由轮换开关决定。
+ *
+ * 只剩纯色档还受这个限制。图片两档已经放开，一律按硬上限 BG_IMAGE_MAX 收：那两档的列表是
+ * 一个图库，攒着不用没有害处，关着轮换时由用户点选用哪一张。颜色不同——
+ * 色板是即点即用的，多选态下「点一下」的含义从「换成这个」变成「加进轮换组」，
+ * 同一个手势两种结果，得有个开关把两态分开。
+ *
+ * 开关本身不要求已有 ≥2 帧：否则「没第二项不让开开关，开关没开不让选第二个色」
+ * 会互相锁死。开着但只有一帧时 store 的 bgRotating 自然是 false（那边要求 ≥2 帧），
+ * 表现为「开了但还没得转」，由 hint 说出来。
+ */
+const colorMulti = computed(() => rotateOn.value)
+
+const rotateHint = computed(() => {
+  if (!rotateOn.value) {
+    /*
+     * 关着的时候说清楚开关管的是什么。
+     *
+     * 纯色档单独一句：那边开关还兼着「能不能多选」，只讲间隔会让用户在色板上
+     * 点第二个颜色没反应时无处可查。图片两档已经没有这层含义，直说轮换即可。
+     */
+    if (settings.bgMode === 'color') return '开启后可选多个颜色，定时轮换'
+    return '开启后在已添加的图片之间定时轮换'
+  }
+  // 开着但还凑不满两帧：说清楚现在没在转，以及差什么
+  if (settings.bgFrames.length < 2) {
+    switch (settings.bgMode) {
+      case 'color':
+        return '再选一个颜色即可开始轮换'
+      case 'local':
+        return '再添加一张图片即可开始轮换'
+      default:
+        return '再填一条可用地址即可开始轮换'
+    }
+  }
+  return `每 ${rotateInterval.value} 秒淡入下一张`
+})
+
+/* ── 纯色档 ───────────────────────────────── */
+
+/** 预设是否已在轮换组里；两边都归一后再比，6 位与 8 位写法才对得上 */
+function isColorPicked(color: string) {
+  const norm = normalizeHex(color)
+  return norm ? settings.bgColors.includes(norm) : false
+}
+
+/**
+ * 点色板：开了轮换是多选（点中的取消选中），没开是单选（整组换成这一个）。
+ *
+ * 单选态不能走 toggleBgColor：它只剩一个颜色时会拒绝移除（纯色档必须有底色），
+ * 于是点第二个颜色变成「两个都在组里」——看着像换了颜色，实际上攒了一组，
+ * 一开轮换就全冒出来。
+ */
+function onColorClick(color: string) {
+  if (colorMulti.value) settings.toggleBgColor(color)
+  else settings.setBgColorOnly(color)
+}
+
+/** 自定义色（不在预设表里的那些）单独列出来，它们要能被改和删 */
+const presetValues = computed(
+  () => new Set(BG_PRESETS.map((preset) => normalizeHex(preset.value) ?? preset.value)),
+)
+
+const customColors = computed(() =>
+  settings.bgColors.filter((color) => !presetValues.value.has(color)),
+)
+
+/*
+ * 取色面板。
+ *
+ * 与 ColorSwatches 同一手法：量一次触发元素的位置存成 anchor，
+ * 面板自己贴着它展开。editingIndex 为 -1 表示「新增」，否则是在改第 n 个。
+ */
+const pickerOpen = ref(false)
+const pickerAnchor = ref<{ left: number; top: number; bottom: number; width: number } | null>(null)
+const pickerDraft = ref('#0e0e11ff')
+const editingIndex = ref(-1)
+
+function anchorFrom(event: MouseEvent) {
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  return { left: rect.left, top: rect.top, bottom: rect.bottom, width: rect.width }
+}
+
+/** 末尾的「+」：开面板挑一个新颜色 */
+function openColorAdd(event: MouseEvent) {
+  editingIndex.value = -1
+  pickerDraft.value = settings.bgColors[settings.bgIndex] ?? '#0e0e11ff'
+  pickerAnchor.value = anchorFrom(event)
+  pickerOpen.value = true
+}
+
+/** 点已有的自定义色：改它 */
+function openColorEdit(event: MouseEvent, color: string) {
+  editingIndex.value = settings.bgColors.indexOf(color)
+  pickerDraft.value = color
+  pickerAnchor.value = anchorFrom(event)
+  pickerOpen.value = true
+}
+
+/**
+ * 面板每拖一帧都会回调。
+ *
+ * 新增态下第一帧就先落进列表，之后转为改这一项——否则拖动过程中看不到
+ * 任何反馈，要等关掉面板才知道选中的是什么颜色。
+ */
+function onPickerInput(next: string) {
+  pickerDraft.value = next
+  if (editingIndex.value < 0) {
+    // 单选态下这一帧就把整组换掉，之后同样转为改第 0 项
+    if (colorMulti.value) settings.addBgColor(next)
+    else settings.setBgColorOnly(next)
+    editingIndex.value = settings.bgColors.indexOf(normalizeHex(next) ?? next)
+    return
+  }
+  settings.updateBgColorAt(editingIndex.value, next)
+}
+
+function closePicker() {
+  pickerOpen.value = false
+  pickerAnchor.value = null
+  editingIndex.value = -1
+}
+
+/* ── 主题色 ───────────────────────────────── */
+
+/*
+ * 主题色的取色面板独立一套状态，不与背景色那套复用。
+ *
+ * 背景色那套带着 editingIndex（在改第几个颜色）与「新增/编辑」两种语义——
+ * 因为纯色档存的是一组颜色。主题色只有一个值，塞进同一套状态就要在每个
+ * 分支里判断「这次是背景还是主题」，两种语义纠缠在一起。各自一份反而更短。
+ */
+const themePickerOpen = ref(false)
+const themePickerAnchor = ref<{ left: number; top: number; bottom: number; width: number } | null>(
+  null,
+)
+
+/** 预设值归一到 8 位，与 store 里存的形态对齐后才能比较选中态 */
+const themePresetValues = computed(
+  () => new Set(THEME_PRESETS.map((preset) => normalizeHex(preset.value) ?? preset.value)),
+)
+
+/** 当前主题色是否为某个预设；否则说明用户用取色器自选过 */
+const themeIsCustom = computed(() => !themePresetValues.value.has(settings.themeColor))
+
+function isThemePicked(value: string) {
+  return settings.themeColor === (normalizeHex(value) ?? value)
+}
+
+function openThemePicker(event: MouseEvent) {
+  themePickerAnchor.value = anchorFrom(event)
+  themePickerOpen.value = true
+}
+
+function closeThemePicker() {
+  themePickerOpen.value = false
+  themePickerAnchor.value = null
+}
+
+/* ── 本地图片档 ───────────────────────────── */
+
+const localFileInput = ref<HTMLInputElement | null>(null)
+const localImageError = ref('')
+
+function pickLocalFiles() {
+  localFileInput.value?.click()
+}
+
+/**
+ * 处理选中的本地文件（可多选）。
+ *
+ * 校验与写库都在 store 里（它要按 BG_IMAGE_MAX 逐个数、逐个写 IndexedDB），
+ * 这里只负责把被拒的文件汇总成一句话。
+ */
+async function onLocalFilesPicked(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  // 清掉 value，允许用户连续两次选同一批文件（否则 change 不会触发第二次）
+  input.value = ''
+
+  if (files.length === 0) return
+
+  /*
+   * 整批交给 store，不在这里截断。
+   *
+   * 曾经在关着轮换时只取第一张，现在图片档不受轮换开关限制了：多加几张只是
+   * 攒了个图库，用哪一张由勾决定。数量仍有硬上限（BG_IMAGE_MAX），由 store 逐个数，
+   * 超出的那些带原因回来，汇总成一句话显示。
+   */
+  const rejected = await settings.addBgLocalImages(files)
+  localImageError.value =
+    rejected.length === 0
+      ? ''
+      : rejected.map((item) => `${item.name}：${item.reason}`).join('；')
+}
+
+/**
+ * 这一项是否正被用作背景。
+ *
+ * 比的是 store 算出的当前帧 key，而不是「列表里的第几个」：bgFrames 会过滤掉
+ * 字节丢失的本地图和空地址行，两边的下标对不上。key 由各档前缀加 id 组成，
+ * 与 store 里造帧时用的一致。
+ */
+function isPicked(key: string) {
+  return settings.bgCurrentKey === key
+}
+
+/* ── 网络图片档 ───────────────────────────── */
+
+/**
+ * 每行地址的本地草稿。
+ *
+ * 按 id 存而不是按下标：删掉中间一行后下标会整体前移，草稿就会串到隔壁行去。
+ * 输入期间不写 store，避免每敲一个字符都触发一次背景请求。
+ */
+const urlDrafts = ref<Record<string, string>>({})
+/** 格式不合法的行；store 拒绝写入时在这里记一笔，让输入框旁边能说出原因 */
+const urlErrors = ref<Record<string, string>>({})
+
+/** 每行的加载状态：地址合法 ≠ 图能显示出来，见 probeUrl */
+type ProbeState = 'idle' | 'loading' | 'ok' | 'error'
+const urlStates = ref<Record<string, ProbeState>>({})
+
+/*
+ * 每行各领一个号，回调里比对。
+ * 同一行连着改两次地址时先发的请求可能后回来，不比对就会用旧结果覆盖掉新状态。
+ */
+const probeTokens = new Map<string, number>()
+
+/**
+ * 探测一条地址能否加载。
  *
  * 地址合法 ≠ 图能显示出来：防盗链、403、404、图源挂了、HTTPS 页面上引 http 图
  * 被浏览器直接拦掉——这些全都表现为「填完之后背景一点变化都没有」，
  * 而协议校验对它们一无所知。所以这里真的去加载一次，把结果说出来。
  */
-type ImageState = 'idle' | 'loading' | 'ok' | 'error'
-const imageState = ref<ImageState>('idle')
-
-/*
- * 每次探测领一个号，回调里比对。
- * 连着改两次地址时先发的请求可能后回来，不比对就会用旧结果覆盖掉新状态。
- */
-let probeToken = 0
-
-/**
- * 探测一次背景图能否加载。
- *
- * 传入的是 store 归一化后的绝对地址（bgImageHref），不是输入框里的原文——
- * 必须与 CSS 里那张图完全同址，否则探测结果说明不了背景的实际情况。
- */
-function probeImage(href: string | null) {
-  probeToken += 1
-  const token = probeToken
+function probeUrl(id: string, href: string) {
+  const token = (probeTokens.get(id) ?? 0) + 1
+  probeTokens.set(id, token)
 
   if (!href) {
-    imageState.value = 'idle'
+    urlStates.value = { ...urlStates.value, [id]: 'idle' }
     return
   }
 
-  imageState.value = 'loading'
+  urlStates.value = { ...urlStates.value, [id]: 'loading' }
   // 用 Image 而不是 fetch：它与 CSS 背景走同一条 no-cors 图片路径，也命中同一份缓存
   const img = new Image()
   img.onload = () => {
-    if (token === probeToken) imageState.value = 'ok'
+    if (probeTokens.get(id) === token) urlStates.value = { ...urlStates.value, [id]: 'ok' }
   }
   img.onerror = () => {
-    if (token === probeToken) imageState.value = 'error'
+    if (probeTokens.get(id) === token) urlStates.value = { ...urlStates.value, [id]: 'error' }
   }
   img.src = href
 }
 
-/** HTTPS 页面里的 http 图会被浏览器静默拦掉，这种失败要单独说清楚 */
-const isMixedContent = computed(
-  () => window.location.protocol === 'https:' && /^http:\/\//i.test(settings.bgImageHref ?? ''),
-)
+/** 把 store 的地址同步进草稿，并对每条非空地址复验一次 */
+function syncUrlDrafts() {
+  const drafts: Record<string, string> = {}
+  for (const item of settings.bgUrls) {
+    drafts[item.id] = item.url
+    // 上次看到的结果可能已过期：图源挂了 / 又活了
+    probeUrl(item.id, item.url)
+  }
+  urlDrafts.value = drafts
+  urlErrors.value = {}
+}
 
-/** 加载状态对应的提示语；地址格式错误由 imageError 优先展示 */
-const imageStatusText = computed(() => {
-  switch (imageState.value) {
+function applyUrl(id: string) {
+  const draft = urlDrafts.value[id] ?? ''
+  const ok = settings.setBgUrlAt(id, draft)
+  urlErrors.value = { ...urlErrors.value, [id]: ok ? '' : '请填写 http/https 开头的图片地址' }
+  if (ok) probeUrl(id, draft.trim())
+}
+
+function addUrlRow() {
+  const id = settings.addBgUrl()
+  if (!id) return
+  urlDrafts.value = { ...urlDrafts.value, [id]: '' }
+  /*
+   * 新行渲染出来后把焦点送进去。
+   *
+   * 点了「添加一条」却还要再点一次输入框才能打字，是多余的一步；
+   * 键盘用户尤其需要——否则焦点仍留在那个按钮上。
+   */
+  void nextTick(() => {
+    document.getElementById(`bg-url-${id}`)?.focus()
+  })
+}
+
+function removeUrlRow(id: string) {
+  settings.removeBgUrl(id)
+  const { [id]: _draft, ...restDrafts } = urlDrafts.value
+  urlDrafts.value = restDrafts
+  const { [id]: _err, ...restErrors } = urlErrors.value
+  urlErrors.value = restErrors
+  const { [id]: _state, ...restStates } = urlStates.value
+  urlStates.value = restStates
+  probeTokens.delete(id)
+}
+
+/** HTTPS 页面里的 http 图会被浏览器静默拦掉，这种失败要单独说清楚 */
+function isMixedContent(url: string) {
+  return window.location.protocol === 'https:' && /^http:\/\//i.test(url)
+}
+
+function urlStatusText(id: string) {
+  const state = urlStates.value[id] ?? 'idle'
+  switch (state) {
     case 'loading':
       return '正在加载图片…'
     case 'ok':
       return '图片已加载'
     case 'error':
-      return isMixedContent.value
+      return isMixedContent(urlDrafts.value[id] ?? '')
         ? '当前页面是 HTTPS，浏览器会拦掉 http:// 图片，请换用 https 地址'
         : '图片加载失败：地址已失效、需要登录，或图源禁止外链'
     default:
-      return '仅支持网络图片，回车或失焦后应用'
+      return ''
   }
-})
+}
 
-/*
- * 地址一变就重验一次。
+/**
+ * 网络档下的整体提示：把每行的状态汇总成一句。
  *
- * 挂在归一化后的 bgImageHref 上而不是在 applyImage 里手动触发：
- * 「切到图片档」「改地址」「设置被重置」三条路径都会改到它，
- * 逐个补探测调用必然漏掉一条。
- *
- * 不加 immediate：抽屉从未打开过时没人看这条状态，首屏不必多发一次请求；
- * 打开时下面那个 watch 会补上。
+ * 逐行都挂一条状态文字会让列表在 5 行时长出 5 行说明，把下面的设置项挤出视野；
+ * 具体哪一行出了问题由该行输入框自己的描边颜色指示。
  */
-watch(() => settings.bgImageHref, probeImage)
+const urlSummary = computed(() => {
+  const rows = settings.bgUrls
+  if (rows.length === 0) return '仅支持网络图片，回车或失焦后应用'
+
+  const failed = rows.filter((row) => urlStates.value[row.id] === 'error')
+  if (failed.length === 1) return urlStatusText(failed[0].id)
+  if (failed.length > 1) return `${failed.length} 条地址加载失败，已在轮换中跳过`
+
+  const loading = rows.some((row) => urlStates.value[row.id] === 'loading')
+  if (loading) return '正在加载图片…'
+
+  const ok = rows.filter((row) => urlStates.value[row.id] === 'ok').length
+  return ok > 0 ? `${ok} 条地址可用` : '仅支持网络图片，回车或失焦后应用'
+})
 
 // 抽屉重新打开时同步一次，覆盖上次未提交的草稿
 watch(
   () => props.open,
   (open) => {
     if (!open) return
-    imageDraft.value = settings.bgImage
-    imageError.value = ''
-    // 地址没变也复验一次：上次看到的结果可能已经过期（图源挂了 / 又活了）
-    probeImage(settings.bgImageHref)
+    localImageError.value = ''
+    syncUrlDrafts()
   },
 )
 
-function applyImage() {
-  const trimmed = imageDraft.value.trim()
-  if (!trimmed) {
-    settings.setBgImage('')
-    imageError.value = ''
-    return
-  }
-
-  settings.setBgImage(trimmed)
-  // store 只接受 http(s)，写入没生效就说明地址不合法
-  imageError.value = settings.bgImage === trimmed ? '' : '请填写 http/https 开头的图片地址'
-}
+/*
+ * 行数变化时补齐草稿。
+ *
+ * 「设置被重置」会整表换掉 bgUrls，只在 open 时同步会让重置后的列表
+ * 仍显示旧草稿。挂在长度上而不是整个数组上：逐字符提交是本地草稿的事，
+ * 不该反过来触发同步。
+ */
+watch(
+  () => settings.bgUrls.length,
+  () => {
+    for (const item of settings.bgUrls) {
+      if (!(item.id in urlDrafts.value)) {
+        urlDrafts.value = { ...urlDrafts.value, [item.id]: item.url }
+      }
+    }
+  },
+)
 
 /*
  * 滑块拖动期间只改 CSS 变量，不写 store。
@@ -202,6 +502,57 @@ function onScrimOpacityCommit(event: Event) {
 /** 点遮罩关闭：由设置开关控制，关掉后只能靠关闭按钮或 Esc 退出 */
 function onScrimPointerDown() {
   if (settings.closeOnScrim) emit('close')
+}
+
+/* ── 重置为默认 ─────────────────────────────── */
+
+/**
+ * 二次确认对话框是否打开。
+ *
+ * 重置抹掉的是整份布局、设置与待办，而其中本地壁纸的字节已从 IndexedDB 删掉、
+ * 撤不回来，所以走「先问再做」而不是项目里更常见的「先做 + 可撤销」（UndoToast）。
+ * 判据见 ConfirmDialog 的文件头。
+ */
+const confirmResetOpen = ref(false)
+
+/**
+ * 重置。
+ *
+ * 六处存档一次写全，顺序无关（彼此不读对方的状态），但**一处都不能少**——
+ * 用户按下这个按钮期待的是「回到刚装好的样子」，剩下任何一项都会表现为
+ * 「重置了但那个还在」：
+ *
+ *   starfall-hub:grid            布局      → grid.reset()
+ *   starfall-hub:settings        设置      → settings.reset()
+ *   starfall-hub:todos           待办      → resetTodos()
+ *   starfall-hub:search-history  搜索记录  → resetSearchHistory()
+ *   starfall-hub:settings-handle 手柄高度  → resetEdgeHandle()（停靠侧归 settings）
+ *   starfall-hub:weather:*       天气缓存  → clearWeatherCache()
+ *
+ * 布局排在设置之前是刻意的：settings.reset() 会把区域尺寸写回 1440×720，
+ * TileGrid 那个 watch 随即按新尺寸 resize 网格。让 grid.reset() 先落位，
+ * resize 拿到的就是默认布局本身（15×6 与 1440×720 互解，见 tile.ts），
+ * 是一次空操作；反过来则是先按旧尺寸摆好默认布局、再被 resize 挪一遍。
+ *
+ * 抽屉不关：重置后主题色、背景、遮罩深浅全变了，抽屉本身就是这些变化最直接的
+ * 取景框，关掉反而让人不确定到底生效了没有。
+ */
+function doReset() {
+  confirmResetOpen.value = false
+  grid.reset()
+  settings.reset()
+  resetTodos()
+  resetSearchHistory()
+  resetEdgeHandle()
+  clearWeatherCache()
+  /*
+   * 地址行的本地草稿要跟着换。
+   *
+   * 那个按长度变化补齐草稿的 watch 只**新增**没见过的 id，不会删掉已经不存在的，
+   * 也不会在长度恰好没变时触发——重置前后都只有一行时，输入框里还留着用户
+   * 上次填的地址。syncUrlDrafts 整表重建，顺带对新地址重验一次可用性。
+   */
+  syncUrlDrafts()
 }
 
 const panelEl = ref<HTMLElement | null>(null)
@@ -324,74 +675,416 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               @update:model-value="settings.setBgMode"
             />
 
-            <!-- 纯色：预设色板 -->
-            <div
-              v-if="settings.bgMode === 'color'"
-              class="swatches"
-              role="radiogroup"
-              aria-label="背景颜色"
-            >
-              <button
-                v-for="preset in BG_PRESETS"
-                :key="preset.value"
-                class="swatch"
-                :class="{ 'is-active': settings.bgColor === preset.value }"
-                type="button"
-                role="radio"
-                :aria-checked="settings.bgColor === preset.value"
-                :title="preset.label"
-                :style="{ backgroundColor: preset.value }"
-                @click="settings.setBgColor(preset.value)"
-              >
-                <span class="sr-only">{{ preset.label }}</span>
-              </button>
-            </div>
-
-            <!-- 图片：仅支持网络地址，本地文件不进 localStorage -->
-            <template v-else>
-              <div class="field">
-                <label class="field__label" for="bg-image">图片地址</label>
-                <input
-                  id="bg-image"
-                  v-model="imageDraft"
-                  class="field__input"
-                  type="url"
-                  inputmode="url"
-                  placeholder="https://example.com/wallpaper.jpg"
-                  @change="applyImage"
-                  @keydown.enter.prevent="applyImage"
-                />
-                <span v-if="imageError" class="field__error">{{ imageError }}</span>
-                <span
-                  v-else
-                  class="field__hint"
-                  :class="{
-                    'is-error': imageState === 'error',
-                    'is-ok': imageState === 'ok',
-                  }"
+            <!--
+              纯色：预设色板 + 自定义色，可多选。
+              选中的每一个都是轮换里的一帧，末尾的「+」开取色面板加自定义色。
+            -->
+            <template v-if="settings.bgMode === 'color'">
+              <div class="swatches" role="group" aria-label="背景颜色">
+                <button
+                  v-for="preset in BG_PRESETS"
+                  :key="preset.value"
+                  class="swatch"
+                  :class="{ 'is-active': isColorPicked(preset.value) }"
+                  type="button"
+                  :aria-pressed="isColorPicked(preset.value)"
+                  :title="preset.label"
+                  :style="{ backgroundColor: preset.value }"
+                  @click="onColorClick(preset.value)"
                 >
-                  {{ imageStatusText }}
+                  <span class="sr-only">{{ preset.label }}</span>
+                  <!-- 选中态除外圈描边外再给一个勾：一排深灰色块之间，仅靠描边不够快辨认 -->
+                  <svg
+                    v-if="isColorPicked(preset.value)"
+                    class="swatch__tick"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    aria-hidden="true"
+                  >
+                    <path
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2.4"
+                      d="m5 13 4 4L19 7"
+                    />
+                  </svg>
+                </button>
+
+                <!-- 自定义色：点开面板改，右上角的 x 移除 -->
+                <span v-for="color in customColors" :key="color" class="swatch-slot">
+                  <button
+                    class="swatch swatch--custom is-active"
+                    type="button"
+                    :title="`自定义颜色 ${color}`"
+                    :style="{ backgroundColor: color }"
+                    @click="openColorEdit($event, color)"
+                  >
+                    <span class="sr-only">编辑自定义颜色 {{ color }}</span>
+                  </button>
+                  <button
+                    class="swatch-slot__del"
+                    type="button"
+                    :disabled="settings.bgColors.length <= 1"
+                    :aria-label="`移除颜色 ${color}`"
+                    @click="settings.removeBgColor(color)"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-width="2.4"
+                        d="M6 6l12 12M18 6L6 18"
+                      />
+                    </svg>
+                  </button>
+                </span>
+
+                <!--
+                  末尾的添加位：容量满了就禁掉，而不是点了没反应。
+
+                  未开轮换时这里照样可点——它在单选态下是「换成这个自定义色」而不是
+                  追加，所以不该按 colorMax（此时为 1）禁掉。真按了会成死路：
+                  组里剩最后一个颜色时删除入口也是禁着的（纯色档必须有底色），
+                  两头都堵住就再也打不开取色面板了。
+                -->
+                <button
+                  class="swatch swatch--add"
+                  type="button"
+                  :disabled="settings.bgColors.length >= BG_COLOR_MAX"
+                  :title="
+                    settings.bgColors.length >= BG_COLOR_MAX
+                      ? `最多 ${BG_COLOR_MAX} 个颜色`
+                      : colorMulti
+                        ? '添加自定义颜色'
+                        : '换成自定义颜色'
+                  "
+                  aria-label="添加自定义颜色"
+                  @click="openColorAdd"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-width="2"
+                      d="M12 6v12M6 12h12"
+                    />
+                  </svg>
+                </button>
+              </div>
+
+              <p class="group__hint">
+                {{
+                  colorMulti
+                    ? '点色块选中或取消，选中的每个颜色都是轮换里的一帧'
+                    : '开启下方轮换背景后可多选'
+                }}
+              </p>
+            </template>
+
+            <!-- 本地图片：多张缩略图 + 末尾添加位，字节存在 IndexedDB -->
+            <template v-else-if="settings.bgMode === 'local'">
+              <div class="field">
+                <span class="field__label">
+                  添加图片
+                  <span class="field__value">{{ settings.bgLocalImages.length }}/{{ BG_IMAGE_MAX }}</span>
+                </span>
+
+                <!-- 真实文件输入隐藏，视觉入口是下面网格里那个添加位；随时可多选 -->
+                <input
+                  ref="localFileInput"
+                  class="sr-only"
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  @change="onLocalFilesPicked"
+                />
+
+                <div class="thumbs">
+                  <!--
+                    每张图是一个圆角方块。删除按钮常驻在 DOM 里但默认不可见
+                    （见 .thumb__del 的 opacity），悬停或键盘聚焦时才浮出来——
+                    用 v-if 挂载会让它无法被 Tab 到，键盘用户就没有删除入口了。
+                  -->
+                  <div v-for="image in settings.bgLocalImages" :key="image.id" class="thumb">
+                    <img v-if="image.url" class="thumb__img" :src="image.url" :alt="image.name" />
+                    <!-- 字节丢了（隐私模式 / 库被清）时不留空白，说明它为什么不显示 -->
+                    <span v-else class="thumb__gone" :title="`${image.name}：图片数据已丢失`">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                        <rect x="3" y="3" width="18" height="18" rx="3" />
+                        <path stroke-linecap="round" d="M8 8l8 8M16 8l-8 8" />
+                      </svg>
+                    </span>
+
+                    <!--
+                      整块缩略图当选中按钮用，只在关着轮换时挂上（开着时每张都会轮到，
+                      「选中一张」没有意义）。
+
+                      是铺满整块的独立 button，而不是把 .thumb 本身做成 button：
+                      删除按钮在它里面，button 套 button 是非法结构，浏览器会把内层
+                      拆出去，删除就点不到了。它铺在图上、排在删除按钮之前，
+                      靠层序让右下角那一小块仍归删除按钮（见 .thumb__pick 的 z-index）。
+
+                      字节丢了的那张不给点：它进不了 bgFrames，选了也没有对应的帧。
+                    -->
+                    <button
+                      v-if="!rotateOn"
+                      class="thumb__pick"
+                      type="button"
+                      :disabled="!image.url"
+                      :aria-pressed="isPicked(`l:${image.id}`)"
+                      :title="isPicked(`l:${image.id}`) ? '正在使用这张' : '设为背景'"
+                      @click="settings.pickBgFrame(`l:${image.id}`)"
+                    >
+                      <span class="sr-only">{{ image.name || '这张图片' }}</span>
+                    </button>
+
+                    <!--
+                      选中标记贴右上角，与右下角的删除按钮错开，两者不会叠在一起。
+                      半透明深底：缩略图内容不可预测，白勾直接压在浅色照片上会看不见。
+                      轮换开着时不显示——那时候每张都会轮到，标一张出来是误导。
+
+                      始终挂在 DOM 里，显隐交给 class（同 .thumb__del 的做法）。
+                      用 v-if 的话「消失」那一侧没有动画可言：元素已经被拆掉，
+                      浏览器没有可过渡的对象，只会瞬间不见。
+                    -->
+                    <span
+                      class="thumb__tick"
+                      :class="{ 'thumb__tick--on': !rotateOn && isPicked(`l:${image.id}`) }"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path
+                          stroke="currentColor"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          stroke-width="2.6"
+                          d="m5 13 4 4L19 7"
+                        />
+                      </svg>
+                    </span>
+
+                    <button
+                      class="thumb__del"
+                      type="button"
+                      :aria-label="`移除图片 ${image.name || ''}`"
+                      @click="settings.removeBgLocalImage(image.id)"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path
+                          stroke="currentColor"
+                          stroke-linecap="round"
+                          stroke-width="2.2"
+                          d="M6 6l12 12M18 6L6 18"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+
+                  <!-- 末尾的添加位：与缩略图同尺寸，虚线描边区分「还没有内容」 -->
+                  <button
+                    class="thumb thumb--add"
+                    type="button"
+                    :disabled="settings.bgLocalImages.length >= BG_IMAGE_MAX"
+                    :title="
+                      settings.bgLocalImages.length < BG_IMAGE_MAX
+                        ? `可多选 · 单张 ${LOCAL_IMAGE_MAX_BYTES / 1024 / 1024}MB 以内`
+                        : `最多 ${BG_IMAGE_MAX} 张`
+                    "
+                    aria-label="添加本地图片"
+                    @click="pickLocalFiles"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-width="2"
+                        d="M12 6v12M6 12h12"
+                      />
+                    </svg>
+                  </button>
+                </div>
+
+                <span v-if="localImageError" class="field__error">{{ localImageError }}</span>
+                <span v-else class="field__hint">
+                  {{ rotateOn ? '可一次选多张' : '可一次选多张，点缩略图选用哪一张' }} · 单张
+                  {{ LOCAL_IMAGE_MAX_BYTES / 1024 / 1024 }}MB 以内
                 </span>
               </div>
 
-              <!-- 模糊只对图片有意义，纯色底上看不出任何差别，因此不在纯色档露出 -->
+              <!--
+                IndexedDB 写不进去时必须说出来：图在本次会话里能正常显示，
+                刷新后却会消失，不提示的话看起来就是「设置没保存」这种 bug。
+              -->
+              <p v-if="settings.localStoreUnavailable" class="group__hint is-warn">
+                浏览器存储不可用，本地图片仅本次会话有效，刷新后会丢失
+              </p>
+            </template>
+
+            <!-- 网络图片：一列地址，每行可删，末尾按钮追加一行 -->
+            <template v-else>
               <div class="field">
-                <label class="field__label" for="bg-blur">
-                  模糊
-                  <span class="field__value">{{ settings.bgBlur }}px</span>
-                </label>
-                <input
-                  id="bg-blur"
-                  class="slider"
-                  type="range"
-                  min="0"
-                  :max="BLUR_MAX"
-                  step="1"
-                  :value="settings.bgBlur"
-                  @input="settings.setBgBlur(Number(($event.target as HTMLInputElement).value))"
-                />
+                <span class="field__label">
+                  图片地址
+                  <span v-if="settings.bgUrls.length" class="field__value">
+                    {{ settings.bgUrls.length }}/{{ BG_IMAGE_MAX }}
+                  </span>
+                </span>
+
+                <!--
+                  列表最多显示 5 行，再多就在自己内部滚动。
+
+                  这是纯显示上限，不是数量上限（能加到 BG_IMAGE_MAX 条）：
+                  抽屉本身已经是个纵向滚动容器，列表无限长会把下面的模糊、动画、
+                  磨砂等设置项推到视野之外，找不到了。
+                -->
+                <div
+                  class="url-list"
+                  :class="{ 'is-scroll': settings.bgUrls.length > 5, 'has-pick': !rotateOn }"
+                >
+                  <div v-for="(item, index) in settings.bgUrls" :key="item.id" class="url-row">
+                    <input
+                      :id="`bg-url-${item.id}`"
+                      v-model="urlDrafts[item.id]"
+                      class="field__input url-row__input"
+                      :class="{
+                        'is-error': urlErrors[item.id] || urlStates[item.id] === 'error',
+                        'is-ok': urlStates[item.id] === 'ok',
+                      }"
+                      type="url"
+                      inputmode="url"
+                      :aria-label="`第 ${index + 1} 条图片地址`"
+                      placeholder="https://example.com/wallpaper.jpg"
+                      @change="applyUrl(item.id)"
+                      @keydown.enter.prevent="applyUrl(item.id)"
+                    />
+                    <!--
+                      选中按钮：与删除同款，只换图标，排在它左边。
+                      只在关着轮换时出现——开着的时候每条地址都会轮到，
+                      「选中其中一条」没有意义。
+
+                      已选中的那条禁用：它已经是背景了，再点一次什么也不会变，
+                      留着可点会让人以为没生效。禁用态同时也是「这条正在用」的标记。
+                    -->
+                    <button
+                      v-if="!rotateOn"
+                      class="url-row__pick"
+                      type="button"
+                      :disabled="isPicked(`u:${item.id}`)"
+                      :aria-pressed="isPicked(`u:${item.id}`)"
+                      :title="isPicked(`u:${item.id}`) ? '正在使用这条' : '设为背景'"
+                      :aria-label="
+                        isPicked(`u:${item.id}`)
+                          ? `第 ${index + 1} 条地址正在用作背景`
+                          : `将第 ${index + 1} 条地址设为背景`
+                      "
+                      @click="settings.pickBgFrame(`u:${item.id}`)"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path
+                          stroke="currentColor"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          stroke-width="2.4"
+                          d="m5 13 4 4L19 7"
+                        />
+                      </svg>
+                    </button>
+                    <button
+                      class="url-row__del"
+                      type="button"
+                      :aria-label="`删除第 ${index + 1} 条地址`"
+                      @click="removeUrlRow(item.id)"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path
+                          stroke="currentColor"
+                          stroke-linecap="round"
+                          stroke-width="2"
+                          d="M6 6l12 12M18 6L6 18"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+
+                  <!-- 列表末项是占位按钮，点一下追加一行输入框 -->
+                  <button
+                    class="url-add"
+                    type="button"
+                    :disabled="settings.bgUrls.length >= BG_IMAGE_MAX"
+                    @click="addUrlRow"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-width="2"
+                        d="M12 6v12M6 12h12"
+                      />
+                    </svg>
+                    {{
+                      settings.bgUrls.length < BG_IMAGE_MAX ? '添加一条地址' : `最多 ${BG_IMAGE_MAX} 条`
+                    }}
+                  </button>
+                </div>
+
+                <span class="field__hint">{{ urlSummary }}</span>
               </div>
             </template>
+
+            <!--
+              轮换开关与间隔：三档共用这段模板，但读写的是当前档自己的那一套
+              （见 rotateOn / rotateInterval）。放在各档的列表之后，
+              因为它决定列表里那些项是「依次淡入」还是「只用选中的那一个」。
+            -->
+            <ToggleSwitch
+              id="bg-rotate"
+              label="轮换背景"
+              :model-value="rotateOn"
+              :hint="rotateHint"
+              @update:model-value="settings.setBgRotate(settings.bgMode, $event)"
+            />
+
+            <!--
+              间隔只在开着轮换时露出：关着的时候它不影响任何东西，
+              留在那里只会让人以为改了有用。
+            -->
+            <div v-if="rotateOn" class="pair">
+              <NumberField
+                id="bg-interval"
+                label="轮换间隔"
+                :model-value="rotateInterval"
+                :min="BG_INTERVAL_MIN"
+                :max="BG_INTERVAL_MAX"
+                :step="5"
+                unit="秒"
+                :auto-placeholder="String(rotateInterval)"
+                @update:model-value="settings.setBgIntervalFor(settings.bgMode, $event)"
+              />
+            </div>
+
+            <!--
+              模糊对两种图片都有意义（纯色底上看不出任何差别，因此不在纯色档露出），
+              本地与网络图片共用这一档。
+            -->
+            <div
+              v-if="settings.bgMode === 'local' || settings.bgMode === 'image'"
+              class="field"
+            >
+              <label class="field__label" for="bg-blur">
+                模糊
+                <span class="field__value">{{ settings.bgBlur }}px</span>
+              </label>
+              <input
+                id="bg-blur"
+                class="slider"
+                type="range"
+                min="0"
+                :max="BLUR_MAX"
+                step="1"
+                :value="settings.bgBlur"
+                @input="settings.setBgBlur(Number(($event.target as HTMLInputElement).value))"
+              />
+            </div>
           </section>
 
           <!-- ── 动画 ─────────────────────────────── -->
@@ -435,6 +1128,90 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                 @change="onScrimOpacityCommit"
               />
             </div>
+          </section>
+
+          <!-- ── 主题色 ───────────────────────────── -->
+          <section class="group">
+            <h3 class="group__title">主题色</h3>
+
+            <!--
+              与背景色板同构（同一套 .swatch 样式与勾选反馈），但语义是**单选**：
+              主题色只有一个值，点一下就是换成它，没有多选与移除。
+              末尾一格开取色面板自选。
+            -->
+            <div class="swatches" role="group" aria-label="主题色">
+              <button
+                v-for="preset in THEME_PRESETS"
+                :key="preset.value"
+                class="swatch swatch--theme"
+                :class="{ 'is-active': isThemePicked(preset.value) }"
+                type="button"
+                :aria-pressed="isThemePicked(preset.value)"
+                :title="preset.label"
+                :style="{ backgroundColor: preset.value }"
+                @click="settings.setThemeColor(preset.value)"
+              >
+                <span class="sr-only">{{ preset.label }}</span>
+                <svg
+                  v-if="isThemePicked(preset.value)"
+                  class="swatch__tick"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path
+                    stroke="currentColor"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2.4"
+                    d="m5 13 4 4L19 7"
+                  />
+                </svg>
+              </button>
+
+              <!--
+                自定义格：始终在位（不像背景色那样「有才显示」），因为主题色单值，
+                这一格既是入口也是当前自定义值的显示位。用了自选色时标出选中态。
+              -->
+              <button
+                class="swatch swatch--theme"
+                :class="themeIsCustom ? 'is-active' : 'swatch--add'"
+                type="button"
+                :aria-pressed="themeIsCustom"
+                :title="themeIsCustom ? `自定义 ${settings.themeColor}` : '自定义主题色'"
+                :style="themeIsCustom ? { backgroundColor: settings.themeColor } : undefined"
+                @click="openThemePicker"
+              >
+                <span class="sr-only">自定义主题色</span>
+                <!--
+                  没用自选色时这一格没有颜色可显示，就借 .swatch--add 的虚线框 + 居中
+                  图标当入口（与背景色那组的「添加」格同一语言）；用了则变成实心色块。
+                -->
+                <svg v-if="!themeIsCustom" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path
+                    stroke="currentColor"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M12 5v14M5 12h14"
+                  />
+                </svg>
+                <svg v-else class="swatch__tick" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path
+                    stroke="currentColor"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2.4"
+                    d="m5 13 4 4L19 7"
+                  />
+                </svg>
+              </button>
+            </div>
+
+            <p class="group__hint">
+              用于开关、选中标记与 Tab，并给面板掺一层极淡的同色。预设已校过对比度；
+              自选过深或过淡的颜色会让开关的开合状态变得难以分辨。
+            </p>
           </section>
 
           <!-- ── 方块区域 ─────────────────────────── -->
@@ -624,8 +1401,81 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               @update:model-value="settings.setCloseOnScrim"
             />
           </section>
+
+          <!--
+            ── 重置 ───────────────────────────────
+
+            钉在最底下，与上面各组之间多留一条分隔线：它不是一个设置项，
+            而是一个作用于**全部**设置项的动作，混在中间会被误当成某一组的附属。
+            抽屉是纵向滚动容器，放这里也意味着要滚到底才碰得到，正合适。
+          -->
+          <section class="group group--last">
+            <h3 class="group__title">重置</h3>
+            <p class="group__hint">
+              把布局、设置与待办一并恢复成初始状态：默认的方块摆放、壁纸与主题色、
+              以及那条示例待办。搜索记录与天气缓存会被清空。
+            </p>
+            <div class="actions">
+              <button class="btn btn--danger" type="button" @click="confirmResetOpen = true">
+                重置为默认
+              </button>
+            </div>
+          </section>
         </div>
       </aside>
+
+      <!--
+        取色面板：加 / 改纯色档的自定义颜色。
+
+        挂在 .scrim 内部而不是与它并列——外层 OverlayLayer 的 Transition
+        只接受单个根元素，并列的第二个节点会让过渡失效。它自己再 Teleport
+        到 body，且 --z-menu(1200) 高于 --z-drawer(1100)，所以仍浮在抽屉之上。
+      -->
+      <OverlayLayer v-if="pickerOpen && pickerAnchor" name="cp">
+        <ColorPicker
+          :model-value="pickerDraft"
+          :anchor="pickerAnchor"
+          label="背景颜色"
+          @update:model-value="onPickerInput"
+          @close="closePicker"
+        />
+      </OverlayLayer>
+
+      <!--
+        主题色的取色面板。与上面那台是两个独立实例而不是一台切换用途：
+        两者的 v-if 条件、锚点、回调各不相同，共用一台就得在每个回调里分辨
+        「这次是背景还是主题」。同一时刻只可能开一台，多一个节点不占什么。
+      -->
+      <OverlayLayer v-if="themePickerOpen && themePickerAnchor" name="cp">
+        <ColorPicker
+          :model-value="settings.themeColor"
+          :anchor="themePickerAnchor"
+          label="主题色"
+          :alpha="false"
+          @update:model-value="settings.setThemeColor"
+          @close="closeThemePicker"
+        />
+      </OverlayLayer>
+
+      <!--
+        重置的二次确认。
+
+        与两台取色面板同样挂在 .scrim 内部（并列的第二个根节点会让外层过渡失效），
+        自己再 Teleport 到 body。它的 z-index 也是 --z-menu，压在抽屉之上。
+
+        文案把三样东西逐个点名：只说「恢复默认设置」会让人以为方块摆放不受影响，
+        而这正是这次重置里最不可逆的一样。
+      -->
+      <OverlayLayer name="confirm">
+        <ConfirmDialog
+          v-if="confirmResetOpen"
+          title="重置为默认？"
+          message="当前的方块摆放、全部设置与待办清单都会被丢弃，换回初始状态；搜索记录与天气缓存一并清空。已添加的本地壁纸会被删除，此操作无法撤销。"
+          confirm-label="重置"
+          @confirm="doReset"
+          @cancel="confirmResetOpen = false"
+        />
+      </OverlayLayer>
     </div>
   </OverlayLayer>
 </template>
@@ -804,11 +1654,32 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   letter-spacing: 0.02em;
 }
 
+/*
+ * 最后一组（重置）与上面隔开。
+ *
+ * 一条分隔线 + 双倍间距：它是作用于全部设置项的动作，不是又一个设置项。
+ * margin-top 而不是给 .drawer__body 加 justify-content——抽屉的内容比视口高，
+ * 「钉在底部」在滚动容器里只能靠顺序，不能靠对齐。
+ */
+.group--last {
+  margin-top: var(--sp-2);
+  border-top: 1px solid var(--line-subtle);
+  padding-top: 22px;
+}
+
 .group__hint {
   margin: 0;
   color: var(--color-text-faint);
   font-size: var(--fs-sm);
   line-height: 1.5;
+}
+
+/*
+ * 需要用户注意但不是错误：存储不可用属于环境限制，用户改不了，
+ * 只需要知道后果。用 --danger 而不是新造一个警告色——视觉语言里没有黄色档。
+ */
+.group__hint.is-warn {
+  color: var(--danger);
 }
 
 /* ── 色板 ─────────────────────────────────────────── */
@@ -846,7 +1717,473 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
     var(--shadow-sm);
 }
 
+/*
+ * 主题色块的选中环不能用 --accent。
+ *
+ * --accent 就是当前主题色，而被选中的那一格底色恰好也是它——环会融进色块里，
+ * 一排色块看不出选中的是哪个。这里换中性亮边：它与任何色相的预设都分得开。
+ */
+.swatch--theme.is-active {
+  box-shadow:
+    0 0 0 2px var(--color-text),
+    var(--shadow-sm);
+}
+
 .swatch:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/*
+ * 选中勾。
+ *
+ * 颜色写死 #fff 而不是用 --color-text：色块的底色由用户选，
+ * 令牌色在浅色块上可能与底一致。深色预设配白勾，加一层投影兜住极浅的自定义色。
+ */
+.swatch__tick {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 16px;
+  height: 16px;
+  color: #fff;
+  filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.6));
+  transform: translate(-50%, -50%);
+}
+
+/* 自定义色与删除按钮共用一个定位上下文，删除按钮才能贴到它右上角 */
+.swatch-slot {
+  position: relative;
+  display: block;
+}
+
+.swatch-slot .swatch {
+  width: 100%;
+}
+
+/*
+ * 自定义色的删除入口常驻。
+ *
+ * 与缩略图那边（悬停才显形）不同：色块只有 34px 高，悬停才出现的按钮会盖住
+ * 大半个色块，反而看不清自己选的颜色；这里体积小、位置在角上，常驻更省事。
+ */
+.swatch-slot__del {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  display: grid;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--surface-2);
+  color: var(--color-text-dim);
+  place-items: center;
+  transition:
+    color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+
+.swatch-slot__del svg {
+  width: 9px;
+  height: 9px;
+}
+
+.swatch-slot__del:hover:not(:disabled) {
+  border-color: var(--color-text-faint);
+  color: var(--danger);
+}
+
+.swatch-slot__del:disabled {
+  color: var(--color-text-disabled);
+  cursor: default;
+}
+
+.swatch-slot__del:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* 添加位：虚线描边表示「这里还没有内容」，与缩略图的添加位同一语言 */
+.swatch--add {
+  display: grid;
+  border-style: dashed;
+  background: var(--fill);
+  color: var(--color-text-faint);
+  place-items: center;
+}
+
+.swatch--add svg {
+  width: 16px;
+  height: 16px;
+}
+
+.swatch--add:hover:not(:disabled) {
+  color: var(--color-text);
+}
+
+.swatch--add:disabled {
+  color: var(--color-text-disabled);
+  cursor: default;
+  transform: none;
+}
+
+/* ── 本地图片缩略图 ───────────────────────────────── */
+
+/*
+ * 固定 4 列，与色板同一栅格。
+ * aspect-ratio: 1 让每格是正方形，圆角由 --r-md 给。
+ */
+.thumbs {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--sp-2);
+}
+
+.thumb {
+  position: relative;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.thumb__img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+/* 字节丢失的占位：与「加载失败」同一个弱化灰，不用 --danger 喊 */
+.thumb__gone {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  color: var(--color-text-faint);
+  place-items: center;
+}
+
+.thumb__gone svg {
+  width: 22px;
+  height: 22px;
+}
+
+/*
+ * 删除按钮：贴右下角，默认透明。
+ *
+ * 用 opacity 而不是 display/v-if——它必须始终留在无障碍树与 Tab 序列里，
+ * 否则键盘用户没有任何删除入口。聚焦时同样显形（:focus-visible 分支），
+ * 不然 Tab 到了却看不见焦点落在哪。
+ */
+.thumb__del {
+  position: absolute;
+  /* 压在铺满的选中区（z-index: 1）之上，右下角那一小块才归删除 */
+  z-index: 3;
+  right: 4px;
+  bottom: 4px;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-sm);
+  /* 缩略图内容不可预测，按钮自带深底才能保证 x 在任何图上都看得见 */
+  background: rgb(6 6 8 / 0.72);
+  color: #fff;
+  opacity: 0;
+  place-items: center;
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    background-color var(--dur-fast) var(--ease);
+}
+
+.thumb__del svg {
+  width: 13px;
+  height: 13px;
+}
+
+.thumb:hover .thumb__del,
+.thumb__del:focus-visible {
+  opacity: 1;
+}
+
+.thumb__del:hover {
+  background: rgb(6 6 8 / 0.88);
+  color: var(--danger);
+}
+
+.thumb__del:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+/*
+ * 选中用的点击区：铺满整块缩略图。
+ *
+ * 自身不画任何东西（选中态由右上角的勾表达），只承接点击。
+ * 铺满是有意的——「点这张图用它」里被点的对象就是整张图，
+ * 缩到一个小角标会让人以为图本身不可点。
+ *
+ * z-index 比删除按钮低一级：两者重叠的右下角那一小块必须归删除按钮，
+ * 否则想删的时候点到的是「设为背景」。
+ */
+.thumb__pick {
+  position: absolute;
+  z-index: 1;
+  border-radius: inherit;
+  inset: 0;
+}
+
+.thumb__pick:disabled {
+  cursor: not-allowed;
+}
+
+.thumb__pick:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+/* 悬停时压一层薄暗，说明这块是可点的；选中的那张已有勾，不需要再提示 */
+.thumb__pick:hover:not(:disabled) {
+  background: rgb(6 6 8 / 0.28);
+}
+
+.thumb__pick[aria-pressed='true']:hover {
+  background: none;
+}
+
+/*
+ * 选中勾：右上角，自带半透明深底。
+ *
+ * 底不能省——缩略图是用户自己的照片，纯白勾压在浅色天空上就消失了。
+ * 与右下角的删除按钮分处两角，同时出现也不重叠。
+ * pointer-events: none 让点击穿到下面铺满的选中按钮，
+ * 否则勾自己会把「再点一下这张」的点击吃掉。
+ *
+ * 常驻 DOM，靠 --on 开合，两个方向都有过渡（见模板注释）。缩放比 ContextMenu 的
+ * 0.96 深得多：那是一整块菜单，缩 4% 已是可观位移；这里只有 22px，同样比例
+ * 折算下来不足 1px，等于没动。缩放原点压在右上角——它贴着那个角，
+ * 从中心缩放会让它在出现过程中离角一小段又贴回去。
+ */
+.thumb__tick {
+  position: absolute;
+  z-index: 2;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-sm);
+  background: rgb(6 6 8 / 0.72);
+  color: #fff;
+  opacity: 0;
+  place-items: center;
+  transform: scale(0.72);
+  transform-origin: top right;
+  pointer-events: none;
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    transform var(--dur-fast) var(--ease);
+}
+
+.thumb__tick--on {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.thumb__tick svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* 添加位与缩略图同尺寸，虚线描边 */
+.thumb--add {
+  display: grid;
+  border-style: dashed;
+  background: var(--fill);
+  color: var(--color-text-faint);
+  place-items: center;
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+.thumb--add svg {
+  width: 20px;
+  height: 20px;
+}
+
+.thumb--add:hover:not(:disabled) {
+  border-color: var(--color-text-faint);
+  background: var(--fill-hover);
+  color: var(--color-text);
+}
+
+.thumb--add:disabled {
+  color: var(--color-text-disabled);
+  cursor: default;
+}
+
+.thumb--add:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* ── 网络地址列表 ─────────────────────────────────── */
+
+/*
+ * 行高固定成一个变量，下面的滚动上限直接乘它。
+ *
+ * 曾经按 .field__input 的 padding + 字号「推算」出 34px，实测行高却是 37px
+ * ——字号是 rem 派生的，推算差 3px，5 行就差出 15px，正好把第五行切掉一截，
+ * 「最多显示 5 条」变成 4 条半。行高与上限共用同一个值就不会再错位。
+ */
+.url-list {
+  --url-row-h: 37px;
+  /* 行尾按钮占的总宽（含与输入框之间的 gap），添加行据此对齐右边缘 */
+  --url-tail-w: calc(30px + var(--sp-1));
+
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+/* 关着轮换时每行多一个「勾」，行尾宽度翻一倍 */
+.url-list.has-pick {
+  --url-tail-w: calc(30px * 2 + var(--sp-1) * 2);
+}
+
+/*
+ * 超过 5 行就在列表内部滚动。
+ *
+ * 这是纯显示上限（数量上限是 BG_IMAGE_MAX）：抽屉本身已是纵向滚动容器，
+ * 列表无限长会把下面的模糊、动画等设置项推出视野。
+ * padding-right 给滚动条留位，否则它会压在删除按钮上。
+ */
+.url-list.is-scroll {
+  max-height: calc(var(--url-row-h) * 5 + var(--sp-1) * 4);
+  overflow-y: auto;
+  padding-right: var(--sp-1);
+  scrollbar-width: thin;
+}
+
+.url-row {
+  display: flex;
+  height: var(--url-row-h);
+  align-items: center;
+  flex: none;
+  gap: var(--sp-1);
+}
+
+.url-row__input {
+  min-width: 0;
+  flex: 1;
+}
+
+/*
+ * 每行的状态只靠描边色表达，不逐行挂说明文字——
+ * 5 行各带一句会把下面的设置项挤出视野，汇总语在列表下方统一给。
+ */
+.url-row__input.is-error {
+  border-color: var(--danger);
+}
+
+.url-row__input.is-ok {
+  border-color: var(--line-strong);
+}
+
+/* 两个行尾按钮同款同尺寸，差别只在图标与悬停色 */
+.url-row__del,
+.url-row__pick {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: var(--r-sm);
+  color: var(--color-text-faint);
+  place-items: center;
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+.url-row__del svg,
+.url-row__pick svg {
+  width: 14px;
+  height: 14px;
+}
+
+.url-row__del:hover {
+  background: var(--fill-hover);
+  color: var(--danger);
+}
+
+/*
+ * 选中态用 --accent 而不是灰：一列长得一样的地址行里，
+ * 「正在用的是哪条」得能一眼扫出来，弱化灰的勾在禁用后更认不出来。
+ * 这是 --accent 少数几处用途之一（标状态）。
+ */
+.url-row__pick:hover:not(:disabled) {
+  background: var(--fill-hover);
+  color: var(--color-text);
+}
+
+.url-row__pick:disabled {
+  color: var(--accent);
+  cursor: default;
+  /* 不降不透明度：禁用在这里表达的是「已选中」，压暗反而像不可用 */
+  opacity: 1;
+}
+
+.url-row__del:focus-visible,
+.url-row__pick:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+/*
+ * 列表末尾的添加行：虚线框 + 居中图标文案，宽度与输入行对齐
+ * （右侧留出与行尾按钮等宽的空隙，末项不至于比上面几行长出一截）。
+ *
+ * 留多宽跟着行尾有几个按钮走：关着轮换时每行是「勾 + x」两个，
+ * 仍按一个算的话添加行会比上面几行长出 31px，右边缘对不齐。
+ */
+.url-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: var(--url-tail-w);
+  padding: var(--sp-2);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--fill);
+  color: var(--color-text-dim);
+  font-size: var(--fs-sm);
+  gap: var(--sp-1);
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+.url-add svg {
+  width: 14px;
+  height: 14px;
+}
+
+.url-add:hover:not(:disabled) {
+  border-color: var(--color-text-faint);
+  background: var(--fill-hover);
+  color: var(--color-text);
+}
+
+.url-add:disabled {
+  color: var(--color-text-disabled);
+  cursor: default;
+}
+
+.url-add:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
@@ -947,6 +2284,21 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   flex: none;
   background: none;
   color: var(--color-text-dim);
+}
+
+/*
+ * 重置按钮：红字 + 淡红底，与右键菜单的 is-danger、确认框的 .btn--danger 同一套令牌。
+ * 不用实心红底——那会让它成为整个抽屉里最重的元素，而这里要的是「看清了再点」。
+ */
+.btn--danger {
+  border-color: rgb(248 113 113 / 0.32);
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.btn--danger:hover:not(:disabled) {
+  border-color: rgb(248 113 113 / 0.5);
+  background: rgb(248 113 113 / 0.24);
 }
 
 .btn:disabled {

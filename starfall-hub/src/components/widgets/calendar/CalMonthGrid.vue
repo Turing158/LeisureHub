@@ -103,16 +103,19 @@ defineProps<{
 }
 
 /*
- * 今日胶囊。
+ * 今日高亮：小圆角矩形。
  *
- * 圆角取 999px 而非固定值：格子在 split 里约 30×22、在 month 里约 50×40，
- * 固定圆角在前者会显得太方、在后者太圆。
+ * 圆角读 --cal-active-radius（定义在 CalendarWidget 的 .cal 上），
+ * 与 CalWeekRail 的今日块共用同一个值——「今天」在八个版式里是同一件事，
+ * 圆角不该各档各写一个数。它是 em，故仍随当地字号等比缩放。
+ * 回落值写齐，供不经 .cal 直接渲染本组件的调用方（目前没有，留作保险）。
+ *
  * 不铺满整格（留 0.15em 内缩）：方格自身的圆角在 3×3 时半径达 58px，
  * 通铺的块面会被四角切掉一块。
  */
 .mg__cell.is-today {
   margin: 0.15em;
-  border-radius: 999px;
+  border-radius: var(--cal-active-radius, 0.3em);
   background: var(--cal-sub-bg, var(--widget-band-bg));
   color: var(--cal-text, var(--color-text));
   font-weight: 600;

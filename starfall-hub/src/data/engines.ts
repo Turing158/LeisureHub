@@ -23,14 +23,27 @@ export interface EngineDef {
   name: string
   /** 结果页地址，{q} 处填入 encodeURIComponent(query) */
   url: string
-  /** 内置 SVG 名；不用 emoji 当图标，也不取各站 favicon（跨域 + 暴露访问行为） */
-  icon: EngineIcon
+  /**
+   * 引擎图标：内置字形名，或一段 favicon 地址。
+   *
+   * 字形（bing / google / custom）是本站内联的单色线性 SVG，无色相；
+   * favicon（baidu / zhihu 的站点图标）是彩色位图，渲染成 `<img>`。
+   * 判定在 EngineIcon.vue，与 TileIcon 处理「URL 还是文字」同一条逻辑。
+   * favicon 只选本就在全县 UI 都会出现的两家，其余仍用字形。
+   */
+  icon: string
   /** 建议端点；缺省即该引擎不提供建议 */
   suggest?: SuggestSource
 }
 
-/** 引擎图标名，对应 EngineIcon.vue 内置的字形集合 */
-export type EngineIcon = 'baidu' | 'bing' | 'google' | 'zhihu' | 'custom'
+/**
+ * 引擎图标：本站内置字形名，或站点 favicon 地址。
+ *
+ * 字形集合固定为 bing / google / custom，对应 EngineIcon.vue 的线性 SVG；
+ * 交给 favicon 的两家（baidu / zhihu）把这个字段填成各自的图标 URL，
+ * EngineIcon 按「是否 URL」分派 `<svg>` 与 `<img>`。
+ */
+export type EngineIcon = string
 
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
@@ -63,7 +76,7 @@ export const ENGINES: EngineDef[] = [
     id: 'baidu',
     name: '百度',
     url: `https://www.baidu.com/s?wd=${QUERY_TOKEN}`,
-    icon: 'baidu',
+    icon: 'https://www.baidu.com/favicon.ico',
     suggest: {
       /*
        * ie=utf-8 不可省：默认返回 GBK，不带就是一串乱码。
@@ -105,7 +118,7 @@ export const ENGINES: EngineDef[] = [
     id: 'zhihu',
     name: '知乎',
     url: `https://www.zhihu.com/search?type=content&q=${QUERY_TOKEN}`,
-    icon: 'zhihu',
+    icon: 'https://static.zhihu.com/heifetz/favicon.ico',
   },
 ]
 

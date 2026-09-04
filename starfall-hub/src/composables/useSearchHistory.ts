@@ -113,3 +113,15 @@ export function useSearchHistory() {
 
   return { items, hasItems, push, remove, clear }
 }
+
+/**
+ * 清空记录，供设置里的「重置为默认」调用。
+ *
+ * 与 useSearchHistory().clear() 同一件事，只是不必为一次写入去建那个组合式函数
+ * （它返回的 push / remove / hasItems 在那里都用不到）。默认状态就是空——
+ * 记录是用户行为的产物，没有「默认记录」这种东西。
+ */
+export function resetSearchHistory() {
+  items.value = []
+  persist()
+}

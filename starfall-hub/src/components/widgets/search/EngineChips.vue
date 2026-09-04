@@ -154,8 +154,9 @@ const emit = defineEmits<{ select: [id: string] }>()
   padding: 0 var(--sp-2);
   border: 1px solid transparent;
   border-radius: var(--r-full);
-  background: var(--fill-raised);
-  color: var(--color-text-dim);
+  /* 放在搜索方块里时底色跟随该方块的「次要背景」档，否则回落主题 */
+  background: var(--sw-sub-bg, var(--fill-raised));
+  color: var(--sw-sub-text, var(--color-text-dim));
   font-size: var(--fs-sm);
   gap: 5px;
   white-space: nowrap;
@@ -191,19 +192,23 @@ const emit = defineEmits<{ select: [id: string] }>()
 }
 
 .chips__item:hover {
-  background: var(--fill-hover);
-  color: var(--color-text);
+  background: var(--sw-sub-bg, var(--fill-hover));
+  color: var(--sw-text, var(--color-text));
 }
 
 /*
  * 当前引擎用描边标记，**不用 --accent**——它只留给开关轨道、色板选中环、
  * 拖拽落点这三处状态标记。这里是「一组同类里的哪一个」，与色板不同：
  * chip 带文字，描边 + 文字提亮已经足以区分，不需要色相参与。
+ *
+ * 底色与其余 chip 共用一个次面板档；自定义配色时选中感由
+ * 描边（--line-strong） + 提亮的文字（--sw-text）给出，主题下回落到 --fill-hover，
+ * 与默认的 fill-raised 依然能拉开。
  */
 .chips__item.is-current {
   border-color: var(--line-strong);
-  background: var(--fill-hover);
-  color: var(--color-text);
+  background: var(--sw-sub-bg, var(--fill-hover));
+  color: var(--sw-text, var(--color-text));
 }
 
 .chips__item:focus-visible {
@@ -244,7 +249,16 @@ const emit = defineEmits<{ select: [id: string] }>()
 .chips__label {
   min-width: 0;
   overflow: hidden;
-  line-height: 1;
+  /*
+   * line-height 必须给足 descender：小于 1.3 时文字盒只有 em 高，
+   * 而「Bing / Google」的 g 字下伸部要占到约 0.25em——`overflow: hidden`
+   * 会把它裁掉，2 格宽那档正是「Google」被削去下伸的那条。
+   * 取 1.3 而非刚好盖住的 1.25：这台机器回落微软雅黑时下伸更深，
+   * 1.25 量出来只剩 0.25px 富余，不够保险。
+   * 这个值同时是 ellipsis 的横向溢出所需的裁剪，line-height 只解决纵向，
+   * 两者互不干扰。
+   */
+  line-height: 1.3;
   text-overflow: ellipsis;
 }
 </style>

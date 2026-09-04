@@ -3,11 +3,20 @@ import { nanoid } from 'nanoid'
 import { computed, ref, watch } from 'vue'
 
 import { DEFAULT_ENGINE_ID, ENGINES, type EngineDef } from '@/data/engines'
-import { isHexColor } from '@/utils/color'
+import { buildDefaultBgUrls } from '@/data/defaults'
+import { alphaToHex, isHexColor, normalizeHex } from '@/utils/color'
+import {
+  dataUrlToBlob,
+  deleteImage,
+  getImage,
+  listImageIds,
+  putImage,
+  LOCAL_IMAGE_MAX_BYTES,
+} from '@/utils/imageStore'
 import { ENGINE_NAME_MAX, isSafeEngineUrl, type CustomEngine } from '@/types/search'
 
-/** 背景来源：纯色预设 / 网络图片 */
-export type BgMode = 'color' | 'image'
+/** 背景来源：纯色预设 / 本地图片 / 网络图片 */
+export type BgMode = 'color' | 'local' | 'image'
 /** 动画开关：跟随系统偏好 / 强制开启 / 强制关闭 */
 export type MotionMode = 'system' | 'always' | 'off'
 /** 磨砂开关：跟随系统的「降低透明度」/ 强制开启 / 强制关闭 */
@@ -62,6 +71,45 @@ const LEGACY_BG_MIGRATION: Record<string, string> = {
 }
 
 
+/**
+ * 主题色预设。
+ *
+ * 与 BG_PRESETS 的取值逻辑相反：那边是「整屏底色」，必须压到低明度；
+ * 这里是**状态标记**（开关轨道、选中环、拖拽落点），要在深色面板上站得住，
+ * 所以统一取中高明度、中饱和度——太暗读不出「开」，太艳就回到被否掉的
+ * indigo-500 观感。六档各占一段色相，同一明度带，并排时只有色相差。
+ *
+ * 首档即改造前写死的 --accent 值，作为默认值：未动过设置的用户观感不变。
+ *
+ * 每档必须同时满足三条对比度约束（逐档实测，不靠估）：
+ *
+ *  1. accent 对染色后的面板底 ≥ 3:1 —— 它是图形边界（开关轨道、选中环），
+ *     走非文本组件门槛；
+ *  2. 开关的浅色 thumb（--color-text）压在轨道 accent 上 ≥ 3:1 ——
+ *     否则「开」态里 thumb 会糊进轨道，二元状态就读不出来了；
+ *  3. --color-text 压在 --accent-solid 上 ≥ 4.5:1 —— 那是正文门槛（提交按钮上是文字）。
+ *
+ * 第 3 条正是 --accent-solid 存在的理由：--accent 自身太亮，文字压上去只有 3.2:1。
+ *
+ * 实测值（面板 / thumb / 文字压 solid）：
+ *   靛蓝 4.40 / 3.15 / 4.77    湖蓝 4.33 / 3.19 / 4.81
+ *   青竹 4.32 / 3.21 / 4.88    琥珀 4.34 / 3.19 / 4.83
+ *   绛梅 4.35 / 3.20 / 4.87    紫藤 4.35 / 3.19 / 4.83
+ *
+ * 后五档是按「过线且留余量（thumb ≥ 3.2）后取最亮」搜出来的：贴着 3.00 选没有容错，
+ * 而越亮越鲜活，一味压暗六档会趋同。改这张表前先按上面三条量一遍。
+ *
+ * 自选色不做校验（用户主动设定，不静默改写），面板里已就此给了提示。
+ */
+export const THEME_PRESETS = [
+  { value: '#5b7cfa', label: '靛蓝' },
+  { value: '#558aaf', label: '湖蓝' },
+  { value: '#4c907f', label: '青竹' },
+  { value: '#a67c52', label: '琥珀' },
+  { value: '#d15f76', label: '绛梅' },
+  { value: '#9173d6', label: '紫藤' },
+] as const
+
 export const BLUR_MAX = 40
 
 /**
@@ -85,46 +133,176 @@ export const CUSTOM_ENGINE_MAX = 12
 export const SCRIM_OPACITY_MIN = 20
 export const SCRIM_OPACITY_MAX = 95
 
-const BG_MODES: readonly BgMode[] = ['color', 'image']
+/*
+ * 单张本地图片的大小上限，从 utils/imageStore 转出。
+ *
+ * 字节本身存 IndexedDB 的 Blob，不再走 localStorage 的 base64，所以这个上限
+ * 不再由 5MB 配额推导（详见 imageStore 的模块注释），只用来挡住误选的巨图。
+ */
+export { LOCAL_IMAGE_MAX_BYTES }
+
+/**
+ * 各档背景的条数上限。
+ *
+ * 纯色档给得宽（色板 8 档 + 自选）；两个图片档收在 12 张——再多就该做一个
+ * 带缩略图网格与分页的管理器，而这里只是抽屉里一段横向排布的方块。
+ */
+export const BG_COLOR_MAX = 24
+export const BG_IMAGE_MAX = 12
+
+/**
+ * 轮换间隔的取值范围，单位为秒。
+ *
+ * 下限 3 秒：再短的话交叉淡入（800ms）还没走完就要换下一张，观感是一直在闪。
+ * 上限 3600 秒（1 小时）足够「一小时换一张」这类用法；更长的周期在一个
+ * 常开标签页上没有实际意义。
+ */
+export const BG_INTERVAL_MIN = 3
+export const BG_INTERVAL_MAX = 3600
+export const BG_INTERVAL_DEFAULT = 30
+
+/**
+ * 一张本地图片的索引项。
+ *
+ * 字节不在这里——它按 id 存在 IndexedDB。url 是运行期由 Blob 造出来的
+ * objectURL，**不持久化**：objectURL 只在当前文档有效，存进存档下次打开就是死链。
+ * 每次启动由 hydrateLocalImages() 重新生成。
+ */
+export interface BgLocalImage {
+  id: string
+  name: string
+  /** 运行期 objectURL；hydrate 完成前 / 字节丢失时为 null */
+  url: string | null
+}
+
+/** 一条网络背景地址。带 id 是因为列表要能逐行编辑与删除，不能用下标当 key */
+export interface BgUrlItem {
+  id: string
+  url: string
+}
+
+/**
+ * 背景轮换的一帧，是渲染层唯一认识的形态。
+ *
+ * 三种来源（纯色 / 本地 / 网络）在这里归一：渲染层只管「这一帧是颜色还是图」，
+ * 不需要知道它来自哪个档、字节存在哪。sig 把「同一个 key 但内容变了」表达出来——
+ * 网络档里编辑一行地址，key（id）不变而 href 变了，交叉淡入要靠 sig 才能察觉。
+ */
+export interface BgFrame {
+  key: string
+  sig: string
+  kind: 'color' | 'image'
+  /** kind === 'color' 时有值 */
+  color?: string
+  /** kind === 'image' 时有值，已是可直接交给 CSS 的绝对地址 */
+  href?: string
+}
+
+const BG_MODES: readonly BgMode[] = ['color', 'local', 'image']
 const MOTION_MODES: readonly MotionMode[] = ['system', 'always', 'off']
 const GLASS_MODES: readonly GlassMode[] = ['system', 'always', 'off']
 const DRAWER_SIDES: readonly DrawerSide[] = ['left', 'right']
 const AREA_MODES: readonly AreaMode[] = ['pixel', 'cell']
 
 const DEFAULTS = {
-  bgMode: 'color' as BgMode,
-  bgColor: BG_PRESETS[1].value as string,
-  bgImage: '',
-  bgBlur: 0,
+  /*
+   * 默认放壁纸而不是纯色。
+   *
+   * 这是**取舍**：这个项目的观感建立在「一张图 + 半透明方块」上，
+   * 纯色底会让 30% 黑的方块底色完全失效（它压在什么上都是同一个灰）。
+   * 图本身不在这里，见 data/defaults.ts 的 WALLPAPER——那是内容。
+   */
+  bgMode: 'image' as BgMode,
+  /*
+   * 纯色档存的是一**组**颜色，而不是单个值。
+   *
+   * 关掉轮换时用其中一个（bgIndex 指向的那个），开启轮换时依次淡入。
+   * 默认只有一档：焦褐，作为切到纯色档时的落点，也是图未就绪时的垫底色
+   * （见 bgBaseColor——图片档取 bgColors[0]）。
+   */
+  bgColors: [normalizeHex(BG_PRESETS[6].value) ?? BG_PRESETS[6].value] as string[],
+  bgLocalImages: [] as BgLocalImage[],
+  /** 网络地址组的内容在 data/defaults.ts（buildDefaultBgUrls），这里只能是空数组——见 reset */
+  bgUrls: [] as BgUrlItem[],
+  /*
+   * 2px 的轻模糊。
+   *
+   * 不是 0：壁纸里的细节（树叶、纹理）会与方格里的小字抢注意力，
+   * 糊掉一点点就够把它压成背景；也远未到「看不出是什么图」的程度。
+   * 纯色档下这个值不生效（见 effectiveBlur）。
+   */
+  bgBlur: 2,
+  /*
+   * 轮换开关与间隔按档分开存。
+   *
+   * 三档各有一套，而不是一个全局开关：用户在纯色档设的「10 秒换一次」不该在
+   * 切到本地图片档时被继承——那边是一组照片，10 秒太快。切回来时上次的设置还在。
+   */
+  bgRotate: { color: false, local: false, image: false } as Record<BgMode, boolean>,
+  bgInterval: {
+    color: BG_INTERVAL_DEFAULT,
+    local: BG_INTERVAL_DEFAULT,
+    image: BG_INTERVAL_DEFAULT,
+  } as Record<BgMode, number>,
   motion: 'system' as MotionMode,
   glass: 'system' as GlassMode,
-  /** 42 对应 --scrim-tint 的默认不透明度，滑块归位到此即恢复默认观感 */
-  scrimOpacity: 42,
+  /*
+   * 主题色默认取**第二档（湖蓝）**。
+   *
+   * 归一到 8 位（预设写的是 6 位）：与 bgColors 同一理由——取色面板产出 8 位，
+   * 两种写法混在一起，「这个预设选中了吗」就要在每个比较点各自归一一次。
+   *
+   * 不取首档靛蓝：那一档最接近改造前写死的 indigo，而湖蓝在这张默认壁纸上
+   * 与图里的冷调同源。三条对比度约束逐档都过（见 THEME_PRESETS 的实测表），
+   * 换档不影响可读性。style.css 里 --theme-color / --accent-solid 的字面兜底值
+   * 必须跟着改成这一档，否则 JS 未执行的首帧会闪一下靛蓝。
+   */
+  themeColor:
+    normalizeHex(THEME_PRESETS[1].value) ?? THEME_PRESETS[1].value,
+  /*
+   * 遮罩压暗到 20%（即 SCRIM_OPACITY_MIN）。
+   *
+   * 42 是 --scrim-tint 的字面默认值，压到下限是刻意的：抽屉与对话框自己已经有
+   * 0.92 的不透明底 + 磨砂，遮罩的职责只是「把注意力从桌面拿走」，
+   * 更深会让壁纸在浮层打开时整屏发黑，观感上像换了一页。
+   */
+  scrimOpacity: SCRIM_OPACITY_MIN,
   drawerSide: 'right' as DrawerSide,
   /** 点遮罩关闭：默认开启，与改造前写死的行为一致 */
   closeOnScrim: true,
   areaMode: 'pixel' as AreaMode,
   /*
-   * 尺寸默认全为 AREA_AUTO（0）。
+   * 尺寸默认 1440×720，两个格子档留空跟随。
    *
-   * 这样未动过设置的用户拿到的仍是改造前的行为——区域铺满可用空间、
-   * 行列数由实测反解，不需要为「默认值该填多少」硬编码一个屏幕尺寸。
+   * 不再全为 AREA_AUTO：AUTO 会按实际视口反解行列，于是**默认布局在不同屏幕上
+   * 落位不同**——15 列放不下时那些方块会被 resize 挤进 overflow 暂存，
+   * 首次打开看到的就不是 data/defaults.ts 画的那张图了。
+   * 写死一档与 DEFAULT_GRID_COLS/ROWS 恰好互解（见那里的注释），
+   * 首帧与量完之后一致；屏幕更大时四周留白居中，更小时可横竖滚动。
+   *
+   * 两个格子档仍留 AUTO：它们只在 areaMode === 'cell' 时参与计算，
+   * 预填一份等于替用户决定另一档的值。
    */
-  areaWidth: AREA_AUTO,
-  areaHeight: AREA_AUTO,
+  areaWidth: 1440,
+  areaHeight: 720,
   areaCols: AREA_AUTO,
   areaRows: AREA_AUTO,
   /*
-   * 搜索建议默认关闭。
+   * 搜索建议默认**开启**。
    *
-   * 建议只能走 JSONP（主流端点全都不发 Access-Control-Allow-Origin），
-   * 而 JSONP 请求会带上该域的 Cookie，等于告诉搜索引擎用户打了什么字。
-   * 这是隐私成本，必须由用户显式接受。关闭时搜索方块仍完全可用。
+   * 这一条曾经默认关闭，理由是：建议只能走 JSONP（主流端点全都不发
+   * Access-Control-Allow-Origin），而 JSONP 请求会带上该域的 Cookie，
+   * 等于告诉搜索引擎用户打了什么字，属于隐私成本、该由用户显式接受。
+   *
+   * 那个成本仍然存在，改成默认开启是因为部署形态变了：这是一个**个人**导航站，
+   * 使用者与部署者是同一个人，「显式接受」那一步的对象就是他自己——而代价是
+   * 每次换机器 / 清过站点数据后都要重新去抽屉里翻一遍开关。开关与它那句
+   * 说明文案原样留着（见 SettingsDrawer 的「搜索建议」），随时能关。
    *
    * 放在全局而不是每个方块的 props 里：它是一条隐私开关，
    * 「这个方块发、那个方块不发」没有意义，只会让用户以为自己已经关掉了。
    */
-  suggestEnabled: false,
+  suggestEnabled: true,
   /** 内联补全默认关闭：它与中文输入法的边界最窄，见 useInlineComplete 的四道门禁 */
   inlineCompleteEnabled: false,
   /*
@@ -138,14 +316,32 @@ const DEFAULTS = {
   searchHistoryEnabled: true,
 }
 
+/**
+ * 本地图片在存档里的形态：只有索引，没有字节。
+ *
+ * 运行期的 BgLocalImage 多一个 url（objectURL），它不能持久化——见该接口的注释。
+ */
+type StoredLocalImage = Pick<BgLocalImage, 'id' | 'name'>
+
 interface SettingsState {
   version: number
   bgMode: BgMode
-  bgColor: string
-  bgImage: string
+  bgColors: string[]
+  bgLocalImages: StoredLocalImage[]
+  bgUrls: BgUrlItem[]
+  bgRotate: Record<BgMode, boolean>
+  bgInterval: Record<BgMode, number>
+  /** 关着轮换时选中的那一帧的 key，按档各存一个 */
+  bgPick: Record<BgMode, string>
   bgBlur: number
+  /* ↓ 旧字段：只在读盘时用于迁移，不再写入 */
+  bgColor?: string
+  bgImage?: string
+  bgLocalImageUrl?: string | null
+  bgLocalImageName?: string
   motion: MotionMode
   glass: GlassMode
+  themeColor: string
   scrimOpacity: number
   drawerSide: DrawerSide
   closeOnScrim: boolean
@@ -233,6 +429,91 @@ function clampScrimOpacity(value: unknown): number {
   return Math.min(SCRIM_OPACITY_MAX, Math.max(SCRIM_OPACITY_MIN, Math.round(value as number)))
 }
 
+/** 轮换间隔（秒）夹进合法区间；非数字回落到默认值 */
+function clampInterval(value: unknown): number {
+  if (!Number.isFinite(value as number)) return BG_INTERVAL_DEFAULT
+  return Math.min(BG_INTERVAL_MAX, Math.max(BG_INTERVAL_MIN, Math.round(value as number)))
+}
+
+/**
+ * 校验一组背景色。
+ *
+ * 逐项走 isHexColor + 迁移旧预设，顺带去重（同一个颜色在轮换里出现两次
+ * 只会表现为「有一次换了但看不出变化」）。全部不合法时回退到默认单色，
+ * 而不是留一个空数组——空数组会让纯色档没有任何可显示的帧。
+ *
+ * 一律归一到 8 位形式。BG_PRESETS 写的是 6 位，取色面板产出的是 8 位，
+ * 两种写法混在同一个数组里，「这个预设选中了吗」就要在每个比较点各自
+ * 归一一次，漏一处的表现是色板上明明在用的那个预设不显示选中态。
+ */
+function sanitizeColors(value: unknown): string[] {
+  if (!Array.isArray(value)) return [...DEFAULTS.bgColors]
+  const out: string[] = []
+  for (const item of value) {
+    if (!isHexColor(item)) continue
+    const color = normalizeHex(migrateBgColor(item.toLowerCase()))
+    if (!color) continue
+    if (!out.includes(color)) out.push(color)
+    if (out.length >= BG_COLOR_MAX) break
+  }
+  return out.length > 0 ? out : [...DEFAULTS.bgColors]
+}
+
+/** 校验本地图片索引；字节是否真的还在库里由 hydrate 阶段核对 */
+function sanitizeLocalImages(value: unknown): BgLocalImage[] {
+  if (!Array.isArray(value)) return []
+  const out: BgLocalImage[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Partial<BgLocalImage>
+    if (typeof row.id !== 'string' || !row.id) continue
+    if (out.some((existing) => existing.id === row.id)) continue
+    out.push({
+      id: row.id,
+      name: typeof row.name === 'string' ? row.name : '',
+      // url 一律从 null 起步：objectURL 只在本次文档有效，存档里的值不可信
+      url: null,
+    })
+    if (out.length >= BG_IMAGE_MAX) break
+  }
+  return out
+}
+
+/** 校验网络地址列表：保留空串行（用户可能加了一行还没填），非空则必须是 http(s) */
+function sanitizeUrls(value: unknown): BgUrlItem[] {
+  if (!Array.isArray(value)) return []
+  const out: BgUrlItem[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Partial<BgUrlItem>
+    if (typeof row.url !== 'string') continue
+    const trimmed = row.url.trim()
+    if (trimmed && !isSafeImageUrl(trimmed)) continue
+    out.push({ id: typeof row.id === 'string' && row.id ? row.id : nanoid(), url: trimmed })
+    if (out.length >= BG_IMAGE_MAX) break
+  }
+  return out
+}
+
+/** 三档各一份的布尔 / 数值表，逐档校验，缺档补默认 */
+function sanitizeModeFlags(value: unknown, fallback: Record<BgMode, boolean>): Record<BgMode, boolean> {
+  const row = (value ?? {}) as Partial<Record<BgMode, unknown>>
+  return {
+    color: typeof row.color === 'boolean' ? row.color : fallback.color,
+    local: typeof row.local === 'boolean' ? row.local : fallback.local,
+    image: typeof row.image === 'boolean' ? row.image : fallback.image,
+  }
+}
+
+function sanitizeModeIntervals(value: unknown): Record<BgMode, number> {
+  const row = (value ?? {}) as Partial<Record<BgMode, unknown>>
+  return {
+    color: clampInterval(row.color),
+    local: clampInterval(row.local),
+    image: clampInterval(row.image),
+  }
+}
+
 function pick<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
   return allowed.includes(value as T) ? (value as T) : fallback
 }
@@ -271,11 +552,53 @@ function sanitizeCustomEngine(value: unknown): CustomEngine | null {
 
 export const useSettingsStore = defineStore('settings', () => {
   const bgMode = ref<BgMode>(DEFAULTS.bgMode)
-  const bgColor = ref<string>(DEFAULTS.bgColor)
-  const bgImage = ref<string>(DEFAULTS.bgImage)
+  /** 纯色档的颜色组；至少一项，见 sanitizeColors */
+  const bgColors = ref<string[]>([...DEFAULTS.bgColors])
+  /** 本地图片组；url 字段由 hydrateLocalImages 填 */
+  const bgLocalImages = ref<BgLocalImage[]>([])
+  /**
+   * 网络地址组；允许含空串行（用户加了行还没填）。
+   *
+   * 初值不是空数组而是那张默认壁纸——DEFAULTS.bgMode 是 'image'，列表为空时
+   * bgFrames 一帧都没有，背景会退回底色，首次打开看到的是纯灰而不是壁纸。
+   * 内容在 data/defaults.ts，理由见那里。
+   */
+  const bgUrls = ref<BgUrlItem[]>(buildDefaultBgUrls())
+  const bgRotate = ref<Record<BgMode, boolean>>({ ...DEFAULTS.bgRotate })
+  const bgInterval = ref<Record<BgMode, number>>({ ...DEFAULTS.bgInterval })
   const bgBlur = ref<number>(DEFAULTS.bgBlur)
+
+  /**
+   * 当前显示的是本档的第几帧。
+   *
+   * **不持久化**：它是运行期游标，轮换时每隔几秒就变一次，写进存档等于每隔几秒
+   * 同步写一次 localStorage。开着轮换时刷新后从头开始，对「一组等价的背景」而言
+   * 从哪张起并不重要。
+   *
+   * 关着轮换时它由 bgPick 决定（见下），刷新后能回到用户选的那一张。
+   */
+  const bgIndex = ref(0)
+
+  /**
+   * 未开轮换时用户选中的那一帧，按档各存一个。
+   *
+   * 与 bgIndex 分开是因为两者的性质不同：bgIndex 是运行期游标，轮换时每隔几秒
+   * 变一次；bgPick 是一次明确的选择（点缩略图 / 点那个勾），必须活过刷新。
+   * 合成一个的话，要么轮换把存档写爆，要么选择存不下来。
+   *
+   * 存的是帧的 key 而不是下标：bgFrames 会过滤掉字节丢失的本地图与空地址行，
+   * 「列表里的第 3 个」和「第 3 帧」不是一回事，删掉中间一项后下标还会整体前移。
+   */
+  const bgPick = ref<Record<BgMode, string>>({ color: '', local: '', image: '' })
   const motion = ref<MotionMode>(DEFAULTS.motion)
   const glass = ref<GlassMode>(DEFAULTS.glass)
+  /**
+   * 主题色：派生出 --accent / --accent-solid，并给面板底色掺一层极淡的染色。
+   *
+   * 存单个值而不是像 bgColors 那样存一组——它不参与轮换，
+   * 「当前主题色」永远只有一个。
+   */
+  const themeColor = ref<string>(DEFAULTS.themeColor)
   const scrimOpacity = ref<number>(DEFAULTS.scrimOpacity)
   const drawerSide = ref<DrawerSide>(DEFAULTS.drawerSide)
   /** 点击遮罩空白处是否关闭浮层（设置抽屉与对话框共用） */
@@ -312,6 +635,13 @@ export const useSettingsStore = defineStore('settings', () => {
   /** 系统的「降低透明度」；glass 为 system 时由它决定是否磨砂 */
   const systemReducedTransparency = ref(false)
 
+  /**
+   * 旧存档里那张 data URL 本地图，等 hydrate 阶段搬进 IndexedDB。
+   *
+   * load() 是同步的而搬运是异步的，所以中间需要这个交接位。
+   */
+  let legacyLocalImage: { dataUrl: string; name: string } | null = null
+
   /** 读取持久化设置；任一字段不合法就单独回退，不整体丢弃 */
   function load() {
     try {
@@ -322,17 +652,80 @@ export const useSettingsStore = defineStore('settings', () => {
       if (parsed?.version !== SCHEMA_VERSION) return
 
       bgMode.value = pick(parsed.bgMode, BG_MODES, DEFAULTS.bgMode)
-      // 旧存档里的配色预设已不在色板上，迁移到最接近的新档位，否则没有一格显示选中态
-      bgColor.value = isHexColor(parsed.bgColor)
-        ? migrateBgColor(parsed.bgColor)
-        : DEFAULTS.bgColor
-      bgImage.value =
-        typeof parsed.bgImage === 'string' && isSafeImageUrl(parsed.bgImage)
-          ? parsed.bgImage.trim()
-          : DEFAULTS.bgImage
+
+      /*
+       * 三档各自的列表，一律「新字段优先，缺了就从旧的单值字段迁移」。
+       *
+       * 不提 SCHEMA_VERSION：版本一变上面那句会整份丢弃存档（连方块区域尺寸、
+       * 抽屉侧一起清空），代价远大于收益——与 closeOnScrim 当初的加法一致。
+       */
+      bgColors.value = Array.isArray(parsed.bgColors)
+        ? sanitizeColors(parsed.bgColors)
+        : // 旧存档只有单个 bgColor：包成一项，观感与改造前完全相同
+          sanitizeColors(isHexColor(parsed.bgColor) ? [parsed.bgColor] : undefined)
+
+      bgLocalImages.value = sanitizeLocalImages(parsed.bgLocalImages)
+
+      bgUrls.value = Array.isArray(parsed.bgUrls)
+        ? sanitizeUrls(parsed.bgUrls)
+        : // 旧存档的单个 bgImage 迁成一行
+          sanitizeUrls(
+            typeof parsed.bgImage === 'string' && parsed.bgImage.trim()
+              ? [{ id: nanoid(), url: parsed.bgImage.trim() }]
+              : undefined,
+          )
+
+      bgRotate.value = sanitizeModeFlags(parsed.bgRotate, DEFAULTS.bgRotate)
+      bgInterval.value = sanitizeModeIntervals(parsed.bgInterval)
       bgBlur.value = clampBlur(parsed.bgBlur)
+
+      /*
+       * 选中项。
+       *
+       * 只收字符串，不校验 key 是否还指向存在的帧——那一步交给读它的 watch：
+       * 找不到就退回第一帧。在这里校验反而更早：bgLocalImages 的 url 要等
+       * hydrateLocalImages 异步接完才有，此刻本地图那档的帧全是空的。
+       */
+      if (parsed.bgPick && typeof parsed.bgPick === 'object') {
+        bgPick.value = {
+          color: typeof parsed.bgPick.color === 'string' ? parsed.bgPick.color : '',
+          local: typeof parsed.bgPick.local === 'string' ? parsed.bgPick.local : '',
+          image: typeof parsed.bgPick.image === 'string' ? parsed.bgPick.image : '',
+        }
+      }
+
+      /*
+       * 旧的单张本地图：data URL 还在 localStorage 里，搬进 IndexedDB 再挂进列表。
+       *
+       * 异步进行（fetch data URL + IDB 写入都是异步的），所以这里只登记待迁移的
+       * 载荷，实际搬运在 hydrateLocalImages() 里与「补 objectURL」一起做——
+       * 两者都要触碰 IDB，合成一次遍历。
+       */
+      if (
+        typeof parsed.bgLocalImageUrl === 'string' &&
+        parsed.bgLocalImageUrl.startsWith('data:image/') &&
+        bgLocalImages.value.length === 0
+      ) {
+        legacyLocalImage = {
+          dataUrl: parsed.bgLocalImageUrl,
+          name: typeof parsed.bgLocalImageName === 'string' ? parsed.bgLocalImageName : '',
+        }
+      }
       motion.value = pick(parsed.motion, MOTION_MODES, DEFAULTS.motion)
       glass.value = pick(parsed.glass, GLASS_MODES, DEFAULTS.glass)
+      /*
+       * 主题色。
+       *
+       * 同样不提 SCHEMA_VERSION（见上面那句 `parsed.version !== SCHEMA_VERSION`——
+       * 版本一变整份存档丢弃，用户的背景图、区域尺寸、抽屉侧全部清空）。
+       * 旧存档没这个字段，undefined 时落到默认值，观感与改造前完全一致。
+       */
+      /*
+       * 读盘也要拍 alpha（理由见 setThemeColor）：存档可能来自手改，
+       * 或早于这条约束的版本，带 alpha 的值绕过 setter 直接落进 ref。
+       */
+      const storedTheme = isHexColor(parsed.themeColor) ? normalizeHex(parsed.themeColor) : null
+      themeColor.value = storedTheme ? alphaToHex(storedTheme, 255) : DEFAULTS.themeColor
       scrimOpacity.value = clampScrimOpacity(parsed.scrimOpacity)
       drawerSide.value = pick(parsed.drawerSide, DRAWER_SIDES, DEFAULTS.drawerSide)
       // 旧版本存档没有这个字段，undefined 时保持默认的「开启」
@@ -377,11 +770,22 @@ export const useSettingsStore = defineStore('settings', () => {
     const payload: SettingsState = {
       version: SCHEMA_VERSION,
       bgMode: bgMode.value,
-      bgColor: bgColor.value,
-      bgImage: bgImage.value,
+      bgColors: bgColors.value,
+      /*
+       * 只存 id + name。
+       *
+       * url 是 objectURL，出了本次文档就是死链；字节本身在 IndexedDB 里按 id 存，
+       * 两边靠 id 对齐（见 BgLocalImage 与 utils/imageStore 的注释）。
+       */
+      bgLocalImages: bgLocalImages.value.map(({ id, name }) => ({ id, name })),
+      bgUrls: bgUrls.value,
+      bgRotate: bgRotate.value,
+      bgInterval: bgInterval.value,
+      bgPick: bgPick.value,
       bgBlur: bgBlur.value,
       motion: motion.value,
       glass: glass.value,
+      themeColor: themeColor.value,
       scrimOpacity: scrimOpacity.value,
       drawerSide: drawerSide.value,
       closeOnScrim: closeOnScrim.value,
@@ -417,46 +821,465 @@ export const useSettingsStore = defineStore('settings', () => {
   })
 
   /**
-   * 背景图最终交给浏览器的绝对地址；非图片模式或地址不合法时为 null。
+   * 当前档的帧列表——渲染层唯一的入口。
    *
-   * 抽屉的加载探测也读它，保证「探测的那张图」与「CSS 里那张图」是同一个地址——
-   * 各自拿原始输入去归一化的话，两边只要有一处实现漂移，探测结果就会骗人。
+   * 三档在这里归一成同一种形态（见 BgFrame）：纯色档每个颜色一帧，
+   * 本地档每张已 hydrate 出 objectURL 的图一帧，网络档每条合法地址一帧。
+   *
+   * 不合法 / 未就绪的项直接不出现在列表里，而不是产出一个「空帧」——
+   * 渲染层只要按列表画就行，不必再逐帧判断能不能用。列表为空时（例如网络档
+   * 一条地址都还没填）背景退回底色，与改造前地址非法时的行为一致。
    */
-  const bgImageHref = computed(() =>
-    bgMode.value === 'image' ? resolveImageUrl(bgImage.value) : null,
-  )
-
-  /** 图片模式且地址合法——决定背景层是否真的在渲染图片 */
-  const hasBgImage = computed(() => bgImageHref.value !== null)
-
-  /** 背景样式：纯色直接铺底；图片地址非法时退回纯色，避免整屏空白 */
-  const backgroundStyle = computed(() => {
-    const href = bgImageHref.value
-    if (!href) return { backgroundColor: bgColor.value }
-    return {
-      backgroundColor: bgColor.value,
-      backgroundImage: `url("${cssUrl(href)}")`,
-      backgroundSize: 'cover',
-      backgroundPosition: 'center',
-      backgroundRepeat: 'no-repeat',
+  const bgFrames = computed<BgFrame[]>(() => {
+    if (bgMode.value === 'color') {
+      return bgColors.value.map((color) => ({
+        key: `c:${color}`,
+        sig: `c:${color}`,
+        kind: 'color' as const,
+        color,
+      }))
     }
+
+    if (bgMode.value === 'local') {
+      return bgLocalImages.value
+        .filter((item): item is BgLocalImage & { url: string } => item.url !== null)
+        .map((item) => ({
+          key: `l:${item.id}`,
+          sig: `l:${item.id}`,
+          kind: 'image' as const,
+          href: item.url,
+        }))
+    }
+
+    const out: BgFrame[] = []
+    for (const item of bgUrls.value) {
+      const href = resolveImageUrl(item.url)
+      if (!href) continue
+      out.push({
+        key: `u:${item.id}`,
+        /*
+         * sig 带上 href：同一行地址被改写时 key（id）不变，只有 sig 变。
+         * 渲染层靠 sig 判断「这一帧的内容换了」，否则改地址不会触发淡入。
+         */
+        sig: `u:${item.id}:${href}`,
+        kind: 'image' as const,
+        href,
+      })
+    }
+    return out
   })
 
-  /** 实际生效的模糊：纯色底上模糊不产生任何视觉差异，只在图片模式下计入 */
-  const effectiveBlur = computed(() => (hasBgImage.value ? bgBlur.value : 0))
+  /** 本档是否在放图片——决定压暗层 / 噪点层与模糊滑块的去向 */
+  const isImageMode = computed(() => bgMode.value !== 'color')
+
+  /** 当前档的底色：纯色档取当前帧，图片档取第一个颜色作为图未就绪时的垫底 */
+  const bgBaseColor = computed(() => {
+    if (bgMode.value === 'color') {
+      const frames = bgFrames.value
+      if (frames.length === 0) return DEFAULTS.bgColors[0]
+      return frames[bgIndex.value % frames.length].color ?? DEFAULTS.bgColors[0]
+    }
+    return bgColors.value[0] ?? DEFAULTS.bgColors[0]
+  })
+
+  /**
+   * 轮换是否真的在跑。
+   *
+   * 开关开着但只有一帧时不算——一张图之间「轮换」没有意义，定时器空转还会
+   * 每隔几秒触发一次无变化的重算。UI 也读它来决定是否提示「至少两项才会轮换」。
+   */
+  const bgRotating = computed(
+    () => bgRotate.value[bgMode.value] && bgFrames.value.length > 1,
+  )
+
+  /** 当前档的轮换间隔，毫秒 */
+  const bgIntervalMs = computed(() => bgInterval.value[bgMode.value] * 1000)
+
+  /** 实际生效的模糊：纯色底上模糊不产生任何视觉差异，只在图片档计入 */
+  const effectiveBlur = computed(() => (isImageMode.value ? bgBlur.value : 0))
+
+  /** 把帧里的地址拼成 CSS 的 url(...)，转义交给 cssUrl */
+  function frameBackground(frame: BgFrame): string {
+    return frame.href ? `url("${cssUrl(frame.href)}")` : 'none'
+  }
+
+  /* ── 轮换游标 ─────────────────────────────── */
+
+  /**
+   * 前进一帧；列表为空时归零。
+   *
+   * 只动 bgIndex，不写 bgPick——轮换是运行期行为，不该覆盖用户关掉轮换时选的那一张。
+   * 关掉轮换后 bgIndex 会由 bgPick 重新算出来（见下面那个 watch）。
+   */
+  function advanceBg() {
+    const total = bgFrames.value.length
+    bgIndex.value = total > 0 ? (bgIndex.value + 1) % total : 0
+  }
+
+  /** 直接跳到第 n 帧 */
+  function setBgIndex(next: number) {
+    const total = bgFrames.value.length
+    if (total === 0) {
+      bgIndex.value = 0
+      return
+    }
+    bgIndex.value = ((Math.round(next) % total) + total) % total
+  }
+
+  /**
+   * 选中某一帧作为背景（点缩略图 / 点地址行那个勾）。
+   *
+   * 收 key 而不是下标：调用方手里是「这一行 / 这张图」，而它对应第几帧要看
+   * bgFrames 过滤掉了多少项（字节丢失的本地图、空地址行）。让 UI 去算这个下标，
+   * 中间任意一项失效就会选错一张。
+   */
+  function pickBgFrame(key: string) {
+    const at = bgFrames.value.findIndex((frame) => frame.key === key)
+    if (at < 0) return
+    bgIndex.value = at
+    bgPick.value = { ...bgPick.value, [bgMode.value]: key }
+  }
+
+  /** 当前帧的 key，UI 据此标出「正在用的是这个」 */
+  const bgCurrentKey = computed(() => bgFrames.value[bgIndex.value]?.key ?? '')
+
+  /*
+   * 关着轮换时，把游标对回 bgPick 指的那一帧。
+   *
+   * 覆盖三种情况：刷新后（load 只恢复 bgPick）、刚关掉轮换、以及列表增删导致
+   * 下标整体位移。找不到（那一帧被删了 / 存档里的 key 已失效）就退回第一帧，
+   * 与「关掉轮换默认选第一张」一致。
+   */
+  watch(
+    [bgRotating, bgFrames, () => bgPick.value[bgMode.value]],
+    ([rotating, frames, key]) => {
+      if (rotating) return
+      if (frames.length === 0) {
+        bgIndex.value = 0
+        return
+      }
+      const at = frames.findIndex((frame) => frame.key === key)
+      bgIndex.value = at >= 0 ? at : 0
+    },
+    { immediate: true },
+  )
+
+  /*
+   * 换档 / 列表变短时把游标夹回范围内。
+   *
+   * 删掉最后一张图后 bgIndex 会指到列表外，此时 bgFrames[bgIndex] 是 undefined，
+   * 渲染层会当成「没有帧」而退回底色——图明明还在却不显示。
+   */
+  watch(
+    () => bgFrames.value.length,
+    (total) => {
+      if (total > 0 && bgIndex.value >= total) bgIndex.value = 0
+    },
+  )
+
+  /*
+   * 换档时把游标交还给本档自己的选择。
+   *
+   * 不再一律归零：bgPick 是按档存的，回到某一档就该回到上次在那一档选的那张，
+   * 而不是每次切 tab 都跳回第一张。开着轮换的档没有「选中项」，从头开始即可。
+   */
+  watch(bgMode, (mode) => {
+    if (bgRotate.value[mode]) {
+      bgIndex.value = 0
+      return
+    }
+    const at = bgFrames.value.findIndex((frame) => frame.key === bgPick.value[mode])
+    bgIndex.value = at >= 0 ? at : 0
+  })
+
+  /* ── 本地图片：与 IndexedDB 的往来 ────────────── */
+
+  /** IndexedDB 不可用（隐私模式 / 被策略禁用）时置位，UI 据此提示「刷新后会丢失」 */
+  const localStoreUnavailable = ref(false)
+
+  /**
+   * 启动时把 IndexedDB 里的字节接回来。
+   *
+   * 做三件事，合成一次遍历，因为它们都要触碰同一个库：
+   *  1. 旧存档那张 data URL 本地图搬进 IDB（只在首次升级时发生）；
+   *  2. 给每个索引项造 objectURL——存档里没有可用的 url，必须重新生成；
+   *  3. 清掉孤儿字节：settings 里已经删掉、但 IDB 里还留着的 id。
+   *     没有这一步，删过的壁纸会永久占着磁盘且没有任何入口能再删。
+   */
+  async function hydrateLocalImages() {
+    // 1. 旧单图迁移
+    if (legacyLocalImage) {
+      const { dataUrl, name } = legacyLocalImage
+      legacyLocalImage = null
+      const blob = await dataUrlToBlob(dataUrl)
+      if (blob) {
+        const id = nanoid()
+        if (await putImage(id, blob)) {
+          bgLocalImages.value = [{ id, name, url: URL.createObjectURL(blob) }]
+        } else {
+          localStoreUnavailable.value = true
+          // IDB 写不进去，至少让本次会话还能看到这张图
+          bgLocalImages.value = [{ id, name, url: URL.createObjectURL(blob) }]
+        }
+      }
+    }
+
+    // 2. 补 objectURL
+    const alive = new Set<string>()
+    const next: BgLocalImage[] = []
+    for (const item of bgLocalImages.value) {
+      if (item.url) {
+        // 刚迁移过来的那张已经有 url 了，不必再读一次库
+        alive.add(item.id)
+        next.push(item)
+        continue
+      }
+      const blob = await getImage(item.id)
+      if (!blob) {
+        // 字节没了（用户清过站点数据 / 迁移失败）：索引项一起丢掉，不留死项
+        continue
+      }
+      alive.add(item.id)
+      next.push({ ...item, url: URL.createObjectURL(blob) })
+    }
+    bgLocalImages.value = next
+
+    // 3. 清孤儿
+    for (const id of await listImageIds()) {
+      if (!alive.has(id)) await deleteImage(id)
+    }
+  }
 
   function setBgMode(next: BgMode) {
     bgMode.value = pick(next, BG_MODES, DEFAULTS.bgMode)
   }
 
-  function setBgColor(next: string) {
-    if (isHexColor(next)) bgColor.value = next
+  /* ── 纯色档 ───────────────────────────────── */
+
+  /**
+   * 加入一个颜色并让它立即显示。
+   *
+   * 已在组里就只是跳过去显示，不重复添加——重复项在轮换里只表现为
+   * 「换了一次但看不出变化」。
+   */
+  function addBgColor(next: string) {
+    const norm = normalizeHex(next)
+    if (!norm) return
+    const existing = bgColors.value.indexOf(norm)
+    if (existing >= 0) {
+      setBgIndex(existing)
+      return
+    }
+    if (bgColors.value.length >= BG_COLOR_MAX) return
+    bgColors.value = [...bgColors.value, norm]
+    setBgIndex(bgColors.value.length - 1)
   }
 
-  /** 允许写入空串（表示清空），非空时才校验协议 */
-  function setBgImage(next: string) {
-    const trimmed = next.trim()
-    if (!trimmed || isSafeImageUrl(trimmed)) bgImage.value = trimmed
+  /**
+   * 移除一个颜色。
+   *
+   * 组里只剩一个时拒绝——纯色档必须有至少一个颜色可显示，否则整屏没有底色。
+   * UI 侧也据此把最后一个色块的删除入口禁掉，不让用户点了却没反应。
+   */
+  function removeBgColor(color: string) {
+    if (bgColors.value.length <= 1) return
+    const norm = normalizeHex(color) ?? color
+    bgColors.value = bgColors.value.filter((item) => item !== norm && item !== color)
+  }
+
+  /**
+   * 色板上点一下：不在组里就加入，已在组里就移除。
+   *
+   * 真正的多选语义——点选中的那个就是取消选中。曾经的做法是「已在组里则跳过去
+   * 显示」，但那样色板就没有任何取消入口了，选错一个颜色只能去改存档。
+   * 只剩一个时 removeBgColor 会拒绝（纯色档必须有底色），表现为点了没变化，
+   * 这一点由 UI 侧的 title 说明。
+   */
+  function toggleBgColor(color: string) {
+    const norm = normalizeHex(color)
+    if (!norm) return
+    if (bgColors.value.includes(norm)) removeBgColor(norm)
+    else addBgColor(norm)
+  }
+
+  /**
+   * 整组换成单独一个颜色。
+   *
+   * 未开轮换时色板是单选的，点一下就该只剩这一个颜色。用 addBgColor 做不到：
+   * 它是追加语义，点第二下会变成两个颜色都在组里、只是显示跳过去了——
+   * 看起来像单选，实际上悄悄攒了一组，一开轮换就全冒出来。
+   */
+  function setBgColorOnly(color: string) {
+    const norm = normalizeHex(color)
+    if (!norm) return
+    bgColors.value = [norm]
+    setBgIndex(0)
+    /*
+     * 同步 bgPick，别让它继续指着刚被换掉的那个颜色。
+     *
+     * 只剩一个颜色时游标怎么算都是 0，眼下不会显示错。但存档里留着一个失效的 key，
+     * 下次开轮换、再加几个颜色时，那个 watch 会按它去 findIndex——找不到就退回第一帧，
+     * 表现为「明明选的是第三个，刷新后跳回第一个」。
+     */
+    bgPick.value = { ...bgPick.value, color: `c:${norm}` }
+  }
+
+  /** 改写第 n 个颜色（取色面板拖动时逐帧调用） */
+  function updateBgColorAt(index: number, next: string) {
+    const norm = normalizeHex(next)
+    if (!norm || index < 0 || index >= bgColors.value.length) return
+    // 与别的档重了就不写：会造成两个一模一样的色块
+    if (bgColors.value.some((item, at) => item === norm && at !== index)) return
+    const copy = [...bgColors.value]
+    copy[index] = norm
+    bgColors.value = copy
+  }
+
+  /* ── 本地图片档 ───────────────────────────── */
+
+  /**
+   * 加入若干张本地图片，返回被拒绝的文件名与原因。
+   *
+   * 逐个校验 + 写库，而不是先全部读进内存再一次性写：一次选十张 8MB 的图，
+   * 前者的峰值内存是一张，后者是十张。
+   */
+  async function addBgLocalImages(
+    files: File[],
+  ): Promise<{ name: string; reason: string }[]> {
+    const rejected: { name: string; reason: string }[] = []
+
+    for (const file of files) {
+      /*
+       * 上限恒为 BG_IMAGE_MAX，不看 bgRotate。
+       *
+       * 曾经关着轮换时压到 1 张，理由是「多张只在轮换时有意义」。那个理由不成立：
+       * 关着轮换时列表是个图库，用哪一张由 bgPick 决定，攒着几张随时切很正常。
+       * 而压到 1 的代价是想换图必须先删——本地图删的是 IndexedDB 里的字节，不可逆。
+       */
+      if (bgLocalImages.value.length >= BG_IMAGE_MAX) {
+        rejected.push({ name: file.name, reason: `最多 ${BG_IMAGE_MAX} 张` })
+        continue
+      }
+      if (!file.type.startsWith('image/')) {
+        rejected.push({ name: file.name, reason: '不是图片' })
+        continue
+      }
+      if (file.size > LOCAL_IMAGE_MAX_BYTES) {
+        rejected.push({
+          name: file.name,
+          reason: `超过 ${LOCAL_IMAGE_MAX_BYTES / 1024 / 1024}MB`,
+        })
+        continue
+      }
+
+      const id = nanoid()
+      const stored = await putImage(id, file)
+      if (!stored) localStoreUnavailable.value = true
+      /*
+       * 即使写库失败也挂进列表：objectURL 在本次会话内完全可用，
+       * 用户能看到自己刚选的图。刷新后会因为读不到字节而在 hydrate 阶段被丢掉，
+       * localStoreUnavailable 会让抽屉把这件事说出来。
+       */
+      bgLocalImages.value = [
+        ...bgLocalImages.value,
+        { id, name: file.name, url: URL.createObjectURL(file) },
+      ]
+    }
+
+    return rejected
+  }
+
+  /** 移除一张本地图：撤销 objectURL、删字节、摘索引 */
+  async function removeBgLocalImage(id: string) {
+    const target = bgLocalImages.value.find((item) => item.id === id)
+    // 撤销才会真正释放那份 Blob，否则它一直挂在文档上直到关标签页
+    if (target?.url) URL.revokeObjectURL(target.url)
+    bgLocalImages.value = bgLocalImages.value.filter((item) => item.id !== id)
+    await deleteImage(id)
+  }
+
+  /* ── 网络图片档 ───────────────────────────── */
+
+  /** 追加一行空地址（列表末尾那个占位按钮）；上限恒为 BG_IMAGE_MAX，与轮换开关无关 */
+  function addBgUrl(url = ''): string | null {
+    if (bgUrls.value.length >= BG_IMAGE_MAX) return null
+    const id = nanoid()
+    bgUrls.value = [...bgUrls.value, { id, url: url.trim() }]
+    return id
+  }
+
+  /**
+   * 改写某一行的地址。
+   *
+   * 空串照收（用户清空了想重填），非空则必须过协议白名单；不合法时不写入，
+   * 由 UI 侧把「格式不对」提示出来——store 静默丢弃会让输入框看起来吃字。
+   */
+  function setBgUrlAt(id: string, url: string): boolean {
+    const trimmed = url.trim()
+    if (trimmed && !isSafeImageUrl(trimmed)) return false
+    bgUrls.value = bgUrls.value.map((item) => (item.id === id ? { ...item, url: trimmed } : item))
+    return true
+  }
+
+  function removeBgUrl(id: string) {
+    bgUrls.value = bgUrls.value.filter((item) => item.id !== id)
+  }
+
+  /* ── 轮换 ─────────────────────────────────── */
+
+  /**
+   * 只改当前档的开关：整表替换，浅比较才能看到变化（persist 的 watch 没开 deep）。
+   *
+   * 关掉时把这一档收敛成「只用一个背景」的状态：
+   *  - 纯色：多选直接裁成第一个。颜色是无成本的，重选一下就有，留着一组
+   *    没有选中态的色块只会让「现在到底用的哪个」说不清。
+   *  - 本地图 / 网络地址：**列表不动**，只确保有一个选中项。删掉图和地址是
+   *    不可逆的（图连字节一起没），而用户很可能只是临时关掉轮换。
+   *    原来选中的那一项若还在就留着，只有没选过（或选的那项已失效）才落到第一项。
+   */
+  function setBgRotate(mode: BgMode, next: boolean) {
+    bgRotate.value = { ...bgRotate.value, [mode]: next }
+    if (next) return
+
+    if (mode === 'color' && bgColors.value.length > 1) {
+      bgColors.value = [bgColors.value[0]]
+    }
+
+    /*
+     * 选中项落到第一项——但只在原来没有有效选中项时。
+     *
+     * 「第一项」而不是「当前正显示的那一项」：关掉轮换的那一刻画面停在轮换走到的
+     * 某一帧上，把它当成用户的选择是替用户做决定。
+     *
+     * 而已经选过的那一项要留住：图片两档的列表不再随开关增删，用户完全可能
+     * 选中第三张、开一下轮换看看效果、再关回来——每次都跳回第一张等于把
+     * 那次明确的点击丢掉。纯色档走不到这个分支，它的多选刚被裁成一个，
+     * 除第一个以外的 key 都已失效。
+     *
+     * bgFrames 此刻可能还没跟上（纯色刚裁完，computed 未必已重算），所以按 mode
+     * 各自在源数组里找，而不是读 bgFrames。
+     */
+    const prev = bgPick.value[mode]
+    let key = ''
+    if (mode === 'color') {
+      const at = bgColors.value.find((color) => `c:${color}` === prev)
+      key = at ? prev : bgColors.value[0] ? `c:${bgColors.value[0]}` : ''
+    } else if (mode === 'local') {
+      const valid = bgLocalImages.value.filter((item) => item.url !== null)
+      const kept = valid.find((item) => `l:${item.id}` === prev)
+      const first = kept ?? valid[0]
+      key = first ? `l:${first.id}` : ''
+    } else {
+      const valid = bgUrls.value.filter((item) => resolveImageUrl(item.url) !== null)
+      const kept = valid.find((item) => `u:${item.id}` === prev)
+      const first = kept ?? valid[0]
+      key = first ? `u:${first.id}` : ''
+    }
+    bgPick.value = { ...bgPick.value, [mode]: key }
+  }
+
+  function setBgIntervalFor(mode: BgMode, next: number) {
+    bgInterval.value = { ...bgInterval.value, [mode]: clampInterval(next) }
   }
 
   function setBgBlur(next: number) {
@@ -469,6 +1292,23 @@ export const useSettingsStore = defineStore('settings', () => {
 
   function setGlass(next: GlassMode) {
     glass.value = pick(next, GLASS_MODES, DEFAULTS.glass)
+  }
+
+  /**
+   * 设主题色。
+   *
+   * 非法值静默忽略而不是回落到默认：调用方是色板与取色面板，
+   * 后者拖动时逐帧回调，中途出现一个不合法值就跳回默认色会闪一下。
+   *
+   * **alpha 一律拍成不透明**。ColorPicker 带透明度滑杆，而半透明的主题色
+   * 会同时毁掉它的两个用途：开关轨道透出底下的面板色，「开」态读不出来；
+   * 面板染色那一步 color-mix 掺进来的也是半透明值，等于什么都没掺。
+   * 背景色那边透明度是有意义的（透出壁纸），这里没有。
+   */
+  function setThemeColor(next: string) {
+    const norm = normalizeHex(next)
+    if (!norm) return
+    themeColor.value = alphaToHex(norm, 255)
   }
 
   function setScrimOpacity(next: number) {
@@ -584,13 +1424,44 @@ export const useSettingsStore = defineStore('settings', () => {
     return found ?? ENGINES.find((engine) => engine.id === DEFAULT_ENGINE_ID) ?? ENGINES[0]
   }
 
+  /**
+   * 恢复默认设置。
+   *
+   * 一律逐字段写回 DEFAULTS 而不是「重建 store」：那些 watch（persist、
+   * data-motion / data-glass、两个 CSS 变量）都挂在现有的 ref 上，
+   * 换掉引用等于让它们全部失联。
+   */
   function reset() {
     bgMode.value = DEFAULTS.bgMode
-    bgColor.value = DEFAULTS.bgColor
-    bgImage.value = DEFAULTS.bgImage
+    bgColors.value = [...DEFAULTS.bgColors]
+    // 图片字节一并清掉：留着就是永久孤儿，没有任何入口能再删
+    for (const item of bgLocalImages.value) {
+      if (item.url) URL.revokeObjectURL(item.url)
+      void deleteImage(item.id)
+    }
+    bgLocalImages.value = []
+    /*
+     * 网络地址回到那张默认壁纸，不是清空。
+     *
+     * DEFAULTS.bgMode 是 'image'，清空会让 bgFrames 一帧都没有、背景退回底色——
+     * 「重置」的结果就成了一屏纯灰，与首次打开看到的完全不同。
+     */
+    bgUrls.value = buildDefaultBgUrls()
+    bgRotate.value = { ...DEFAULTS.bgRotate }
+    bgInterval.value = { ...DEFAULTS.bgInterval }
+    bgIndex.value = 0
+    /*
+     * bgPick 三档一起清空，不去指向刚建的那一行。
+     *
+     * 关着轮换时那个 watch 会按 key 找不到而退回第一帧（见它的注释），
+     * 而默认每档都只有一帧，「第一帧」就是唯一正确的答案。写一个具体的 key
+     * 反而要求这里知道 buildDefaultBgUrls 现取的是哪个 id。
+     */
+    bgPick.value = { color: '', local: '', image: '' }
     bgBlur.value = DEFAULTS.bgBlur
     motion.value = DEFAULTS.motion
     glass.value = DEFAULTS.glass
+    themeColor.value = DEFAULTS.themeColor
     scrimOpacity.value = DEFAULTS.scrimOpacity
     drawerSide.value = DEFAULTS.drawerSide
     closeOnScrim.value = DEFAULTS.closeOnScrim
@@ -621,14 +1492,28 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   load()
+  /*
+   * 读盘之后立刻接回 IndexedDB 里的字节。
+   *
+   * 不 await：store 的 setup 必须同步返回。hydrate 完成前 bgLocalImages 的每项
+   * url 都是 null，bgFrames 会把它们过滤掉——本地图片档在这一小段时间里显示底色，
+   * 与「图还没加载完」是同一种观感，不需要额外的加载态。
+   */
+  void hydrateLocalImages()
+
   watch(
     [
       bgMode,
-      bgColor,
-      bgImage,
+      bgColors,
+      bgLocalImages,
+      bgUrls,
+      bgRotate,
+      bgInterval,
+      bgPick,
       bgBlur,
       motion,
       glass,
+      themeColor,
       scrimOpacity,
       drawerSide,
       closeOnScrim,
@@ -685,13 +1570,35 @@ export const useSettingsStore = defineStore('settings', () => {
     { immediate: true },
   )
 
+  /*
+   * 主题色同样落成 <html> 上的一个 CSS 变量，与 --scrim-opacity 同构。
+   *
+   * style.css 只认 --theme-color 这一个入口，其余（--accent、--accent-solid、
+   * 面板染色、Tab 滑块）全在那边用 color-mix 派生——把派生放 CSS 里而不是在
+   * 这里算好几个值写下来，是因为那些比例是视觉取舍，该和它们的注释待在一起。
+   */
+  watch(
+    themeColor,
+    (value) => {
+      document.documentElement.style.setProperty('--theme-color', value)
+    },
+    { immediate: true },
+  )
+
   return {
     bgMode,
-    bgColor,
-    bgImage,
+    bgColors,
+    bgLocalImages,
+    bgUrls,
+    bgRotate,
+    bgInterval,
+    bgIndex,
+    bgPick,
     bgBlur,
+    localStoreUnavailable,
     motion,
     glass,
+    themeColor,
     scrimOpacity,
     drawerSide,
     closeOnScrim,
@@ -710,16 +1617,34 @@ export const useSettingsStore = defineStore('settings', () => {
     resolveEngine,
     motionEnabled,
     glassEnabled,
-    hasBgImage,
-    bgImageHref,
+    bgFrames,
+    isImageMode,
+    bgBaseColor,
+    bgRotating,
+    bgIntervalMs,
+    bgCurrentKey,
     effectiveBlur,
-    backgroundStyle,
+    frameBackground,
+    advanceBg,
+    setBgIndex,
+    pickBgFrame,
     setBgMode,
-    setBgColor,
-    setBgImage,
+    addBgColor,
+    removeBgColor,
+    toggleBgColor,
+    setBgColorOnly,
+    updateBgColorAt,
+    addBgLocalImages,
+    removeBgLocalImage,
+    addBgUrl,
+    setBgUrlAt,
+    removeBgUrl,
+    setBgRotate,
+    setBgIntervalFor,
     setBgBlur,
     setMotion,
     setGlass,
+    setThemeColor,
     setScrimOpacity,
     setDrawerSide,
     setCloseOnScrim,

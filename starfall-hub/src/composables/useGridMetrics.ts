@@ -112,18 +112,39 @@ export function useGridMetrics(areaEl: Ref<HTMLElement | null>, hostEl: Ref<HTML
     const { gap, cellW, cellH } = gridGeometry.value
 
     /*
-     * 格子档里被显式指定的轴直接采用用户给的数，不从像素反解。
+     * 被显式指定的轴**不看测量值**，两个档位各有各的算法：
      *
-     * 反解会把「刚好差几像素放不下第 n 行」的取整误差算进来，
-     * 用户填 5 行却得到 4 行；而这一档的语义本就是「我说几行就是几行」。
-     * 未指定的轴仍走实测反解。
+     * - 格子档直接采用用户给的数。反解会把「刚好差几像素放不下第 n 行」的取整
+     *   误差算进来，用户填 5 行却得到 4 行；而这一档的语义本就是「我说几行就是几行」。
+     * - 像素档从**用户填的像素**反解，而不是从量到的元素尺寸反解。两者最终会相等
+     *   （areaStyle 就是把这个数写成 width/height），但 ResizeObserver 是异步的，
+     *   中间那一帧仍是旧尺寸——于是「改一次区域尺寸」会先按旧尺寸算出一组行列、
+     *   resize 一次网格，再按新尺寸算一遍、再 resize 一次。第一次那下是有破坏性的：
+     *   缩小时方块被挤进 overflow，等网格变回来时它们已经按 reflow 顺序重排了，
+     *   回不到原来的锚点。**「重置为默认」正是这条路径**——它同时改布局与区域尺寸，
+     *   刚放好的默认布局会被那一帧的旧尺寸压掉。
+     *
+     * 未指定的轴仍走实测反解，那是「跟随画面」的定义。
      */
     const byCell = settings.areaMode === 'cell'
     const measuredCols = fitCount(areaW.value, cellW, gap)
     const measuredRows = fitCount(areaH.value, cellH, gap)
 
-    const cols = byCell && settings.areaCols > 0 ? settings.areaCols : measuredCols
-    const rows = byCell && settings.areaRows > 0 ? settings.areaRows : measuredRows
+    const fixed = fixedPx.value
+    const cols = byCell
+      ? settings.areaCols > 0
+        ? settings.areaCols
+        : measuredCols
+      : fixed.w > 0
+        ? fitCount(fixed.w, cellW, gap)
+        : measuredCols
+    const rows = byCell
+      ? settings.areaRows > 0
+        ? settings.areaRows
+        : measuredRows
+      : fixed.h > 0
+        ? fitCount(fixed.h, cellH, gap)
+        : measuredRows
 
     /**
      * 是否已经量到真实尺寸。
@@ -133,19 +154,19 @@ export function useGridMetrics(areaEl: Ref<HTMLElement | null>, hostEl: Ref<HTML
      * 等量完再放回来时位置已经全乱了——刷新一次布局就变一次。
      * 消费方必须等 ready 为真再动 store。
      *
-     * 格子档里被指定的轴不依赖测量，那一侧无需等待。
+     * 被指定的轴不依赖测量（两档同理，见上），那一侧无需等待。
      */
-    const wReady = areaW.value > 0 || (byCell && settings.areaCols > 0)
-    const hReady = areaH.value > 0 || (byCell && settings.areaRows > 0)
+    const wReady = areaW.value > 0 || fixed.w > 0
+    const hReady = areaH.value > 0 || fixed.h > 0
 
     return {
       ready: wReady && hReady,
       cols: Math.max(1, cols),
       rows: Math.max(1, rows),
-      /** 测量完成后仍连一个完整单元格都放不下 */
+      /** 测量完成后仍连一个完整单元格都放不下；只有跟随画面的轴才可能走到 */
       tooSmall:
-        (areaW.value > 0 && measuredCols < 1 && !(byCell && settings.areaCols > 0)) ||
-        (areaH.value > 0 && measuredRows < 1 && !(byCell && settings.areaRows > 0)),
+        (areaW.value > 0 && measuredCols < 1 && fixed.w <= 0) ||
+        (areaH.value > 0 && measuredRows < 1 && fixed.h <= 0),
     }
   })
 

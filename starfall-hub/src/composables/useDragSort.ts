@@ -15,6 +15,16 @@ interface StartContext {
   index: number
   /** 该槽位元素，用于计算指针相对方格的抓取偏移 */
   el: HTMLElement
+  /**
+   * pending 阶段暂缓 setPointerCapture，改由 window 监听驱动，越过阈值才接管指针。
+   *
+   * 立即捕获会把随后的原生 click 重定向到方格上——内部有控件的方块
+   * （搜索方块的引擎按钮、chips、记录）就再也点不到了。暂缓的代价是
+   * pending 期间指针没被锁定，所以配了两道防线：window 监听保证指针
+   * 快速划出方格也能激活拖拽；onPointerMove / onPointerUp 里的 el 比对
+   * 挡住指针滑过别的方格时冒泡上来的同相位事件。
+   */
+  deferCapture?: boolean
 }
 
 /** 落位探测所需的网格几何，由掌握布局常量的调用方给出 */
@@ -92,6 +102,54 @@ export function useDragSort(options: DragSortOptions) {
   let pendingEvent: PointerEvent | null = null
   let activeEl: HTMLElement | null = null
   let activePointerId: number | null = null
+  /**
+   * 发起按下时的完整 StartContext。
+   *
+   * window 侧监听必须用**同一个** ctx 驱动状态机：里面带着 deferCapture，
+   * beginDrag 靠它在激活那一刻补上指针捕获并摘除 window 监听。就地重建一个
+   * 只有 index / el 的对象会把这份信息丢掉。
+   */
+  let activeCtx: StartContext | null = null
+
+  /* ── 暂缓捕获的 pending 阶段（见 StartContext.deferCapture） ── */
+
+  function onWindowPointerMove(event: PointerEvent) {
+    if (phase.value !== 'pending') return
+    if (event.pointerId !== activePointerId || !activeCtx || fromIndex.value === null) return
+    /*
+     * 按键已在别处松开而 pointerup 被吞（按住时切窗等）：暂缓捕获期间没有
+     * 元素捕获兜底，若无此防线，回来后一次无按键的移动就会凭空激活拖拽。
+     */
+    if (event.buttons === 0) {
+      reset()
+      return
+    }
+    onPointerMove(event, activeCtx)
+  }
+
+  function onWindowPointerUp(event: PointerEvent) {
+    if (phase.value !== 'pending') return
+    if (event.pointerId !== activePointerId || !activeCtx || fromIndex.value === null) return
+    onPointerUp(event, activeCtx)
+  }
+
+  function onWindowPointerCancel(event: PointerEvent) {
+    if (event.pointerId !== activePointerId) return
+    reset()
+  }
+
+  /** 同一组具名函数反复挂 / 摘，addEventListener 对相同参数天然幂等 */
+  function attachWindowListeners() {
+    window.addEventListener('pointermove', onWindowPointerMove, true)
+    window.addEventListener('pointerup', onWindowPointerUp, true)
+    window.addEventListener('pointercancel', onWindowPointerCancel, true)
+  }
+
+  function detachWindowListeners() {
+    window.removeEventListener('pointermove', onWindowPointerMove, true)
+    window.removeEventListener('pointerup', onWindowPointerUp, true)
+    window.removeEventListener('pointercancel', onWindowPointerCancel, true)
+  }
 
   /** 浮层在 dragging 与 settling 两个阶段都要显示 */
   const isActive = computed(() => phase.value === 'dragging' || phase.value === 'settling')
@@ -104,6 +162,7 @@ export function useDragSort(options: DragSortOptions) {
       cancelAnimationFrame(rafId)
       rafId = null
     }
+    detachWindowListeners()
     if (activeEl && activePointerId !== null && activeEl.hasPointerCapture(activePointerId)) {
       activeEl.releasePointerCapture(activePointerId)
     }
@@ -111,6 +170,7 @@ export function useDragSort(options: DragSortOptions) {
     pendingEvent = null
     activeEl = null
     activePointerId = null
+    activeCtx = null
   }
 
   function clearState() {
@@ -231,6 +291,16 @@ export function useDragSort(options: DragSortOptions) {
     layerY.value = rect.top
     layerScale.value = DRAG_SCALE
 
+    /*
+     * 暂缓捕获在这一刻补上：拖拽已经成立，此后原生 click 无所谓了，
+     * 而捕获保证指针划出方格后 move / up 仍然送达。此刻指针必然活跃
+     * （正在 pointermove 里），捕获不会抛错。
+     */
+    if (ctx.deferCapture) {
+      if (activePointerId !== null) ctx.el.setPointerCapture(activePointerId)
+      detachWindowListeners()
+    }
+
     phase.value = 'dragging'
     cacheRects()
     hoverIndex.value = probeDrop()
@@ -262,11 +332,20 @@ export function useDragSort(options: DragSortOptions) {
     startY = event.clientY
     activeEl = ctx.el
     activePointerId = event.pointerId
-    ctx.el.setPointerCapture(event.pointerId)
+    activeCtx = ctx
+    /*
+     * 立即捕获（常态）还是暂缓到越过阈值（内部有控件的方块），
+     * 由发起方在 StartContext 上声明，这里不感知方块内容。
+     */
+    if (ctx.deferCapture) attachWindowListeners()
+    else ctx.el.setPointerCapture(event.pointerId)
   }
 
   function onPointerMove(event: PointerEvent, ctx: StartContext) {
     if (phase.value !== 'pending' && phase.value !== 'dragging') return
+    // 只认发起方格的事件：暂缓捕获的 pending 期间没有锁定指针，
+    // 指针滑过别的方格时那些方格也会把 move 冒泡上来
+    if (ctx.el !== activeEl) return
 
     if (phase.value === 'pending') {
       const moved = Math.hypot(event.clientX - startX, event.clientY - startY)
@@ -280,6 +359,7 @@ export function useDragSort(options: DragSortOptions) {
   }
 
   function onPointerUp(_event: PointerEvent, ctx: StartContext) {
+    if (ctx.el !== activeEl) return
     if (phase.value === 'pending') {
       const index = ctx.index
       reset()

@@ -73,9 +73,12 @@ defineProps<{
   padding: 0.3em 0;
   /*
    * 圆角矩形而非 999px 胶囊：胶囊会把窄格的两端抽成半圆，
-   * 与方格本身的圆角语言不一致；按 em 给则各版式等比。
+   * 与方格本身的圆角语言不一致。
+   *
+   * 具体值读 --cal-active-radius（定义在 CalendarWidget 的 .cal 上），
+   * 与月历网格的今日块共用；它是 em，各版式仍按当地字号等比。
    */
-  border-radius: 0.45em;
+  border-radius: var(--cal-active-radius, 0.3em);
   color: var(--cal-sub-text, var(--color-text-dim));
   gap: 0.3em;
 }
@@ -92,8 +95,11 @@ defineProps<{
   margin: 0.12em 0.9em;
   /* 行高由 1fr 决定，这里不再加竖向 padding，让高亮块吃满一行 */
   padding: 0;
-  /* 块比横排高（整行行高），圆角要相应放大才不显得是个方角条 */
-  border-radius: 0.7em;
+  /*
+   * 不再单独放大圆角（原为 0.7em）。这一档的块确实比横排高，按块高看
+   * 0.3em 显得偏方，但「今天」在八个版式里必须是同一个圆角，
+   * 一档一个数就成了八份真值源；统一到 --cal-active-radius。
+   */
   gap: 0.5em;
 }
 

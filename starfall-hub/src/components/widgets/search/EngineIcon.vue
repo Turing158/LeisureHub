@@ -2,20 +2,43 @@
 /**
  * 引擎图标。
  *
- * 一律内置字形，**不取各站 favicon**：favicon 要么跨域取不到、要么每次渲染都发
- * 一次外部请求暴露访问行为（01-方案设计.md §10 已把「favicon 跨域拿不到」
- * 列为已知风险）。字母 / 几何形与 ContextMenu 的图标集同源：同一套 24 视框、
- * currentColor、1.7 描边。
+ * 分两种来源：
+ *  - **本站字形**（bing / google / custom）：内联线性 SVG。字母 / 几何形与
+ *    ContextMenu 的图标集同源：统一的 24 视框、currentColor、1.7 描边。
+ *  - **站点 favicon**（baidu / zhihu）：彩色位图，渲染成 `<img>`。
  *
- * 首字母而非品牌标识：品牌 logo 有版权，且在 16px 下多数糊成一团。
+ * 判断靠 name 是不是 URL——与 TileIcon 处理「URL 还是文字兜底」同一条逻辑。
+ * favicon 只选两家在全站 UI 都会出现的引擎：它们的彩色图标确实比简化字形
+ * 好认，代价是带色相、偏离了无色相语言；其余仍用本站字形，稳且无色相。
  */
+import { computed } from 'vue'
+
 import type { EngineIcon } from '@/data/engines'
 
-defineProps<{ name: EngineIcon }>()
+const props = defineProps<{ name: EngineIcon }>()
+
+/** 只有明确像 URL 的才当图片加载；字形名 / 自定义兜底走内置字形 */
+const isImage = computed(() => /^(https?:\/\/|data:image\/)/.test(props.name))
 </script>
 
 <template>
-  <svg class="engine-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+  <!--
+    favicon：加载站点真实彩色图标。
+    referrerpolicy=no-referrer 不把本站地址带给第三方；loading=lazy 免得惯藏着不动。
+  -->
+  <img
+    v-if="isImage"
+    class="engine-favicon"
+    :src="name"
+    alt=""
+    aria-hidden="true"
+    loading="lazy"
+    referrerpolicy="no-referrer"
+    draggable="false"
+  />
+
+  <!-- 内置线性字形（本站自绘，无色相） -->
+  <svg v-else class="engine-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
     <!-- 百度：熊掌轮廓的简化——一个圆头 + 三点，比「百」字在 16px 下更可辨 -->
     <template v-if="name === 'baidu'">
       <circle cx="12" cy="13.5" r="5.2" stroke="currentColor" stroke-width="1.6" />
@@ -65,10 +88,18 @@ defineProps<{ name: EngineIcon }>()
 </template>
 
 <style scoped>
-/* 尺寸由调用方给（菜单 16px、按钮 18px、chip 14px），这里只保证不被拉伸 */
-.engine-icon {
+/* 字形 / favicon 尺寸都由调用方给（菜单 16px、按钮 18px、chip 14px），这里只保证不被拉伸 */
+.engine-icon,
+.engine-favicon {
+  display: block;
   width: 100%;
   height: 100%;
   flex: none;
+}
+
+/* favicon 是彩色位图，按 contain 等比容纳，不出格外；给一点圆角不硌眼 */
+.engine-favicon {
+  border-radius: 2px;
+  object-fit: contain;
 }
 </style>

@@ -10,6 +10,14 @@ const props = defineProps<{
   listId: string
   /** 列表项 id 前缀，供输入框的 aria-activedescendant 指向 */
   idPrefix: string
+  /**
+   * 建议列表的自定义配色变量（--suggest-bg / --suggest-text / --suggest-active）。
+   *
+   * 由外层 SearchWidget 算好——颜色校验（isHexColor）在那里，与方块自身的
+   * colorStyle 同一条防线。这里只是把它和定位 rect 拼进同一个 :style，
+   * 让模板上只有一个 style 来源。缺省不传即空对象，CSS 回落到主题令牌。
+   */
+  suggestStyle?: Record<string, string>
 }>()
 
 const emit = defineEmits<{
@@ -30,7 +38,7 @@ const OFFSET = 6
  * 而搜索条在页面顶部，向下永远有空间。只在极矮的窗口里把 max-height 夹一次，
  * 靠 CSS 的 min() 完成，不需要 JS 参与。
  *
- * 宽度**硬绑外框实测宽度**，不写死 550：宽度是 1–6 格可配的，写死会在其余档位下错位。
+ * 宽度**硬绑外框实测宽度**，不写死 550：宽度可配到当前网格的整行，写死会在其余档位下错位。
  */
 function style() {
   const room = Math.max(120, window.innerHeight - props.rect.bottom - OFFSET - MARGIN)
@@ -39,6 +47,8 @@ function style() {
     top: `${props.rect.bottom + OFFSET}px`,
     width: `${props.rect.width}px`,
     '--suggest-room': `${room}px`,
+    // 自定义配色覆盖在定位之后：同名键由后到前者胜，用户色优先于缺省
+    ...props.suggestStyle,
   }
 }
 </script>
@@ -104,7 +114,11 @@ function style() {
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
-  background: var(--bg-search);
+  /*
+   * 面板底色两段式回落：有自定义色用自定义色，否则用主题的搜索面板令牌。
+   * 自定义色是不透明纯色，配了它就不再有磨砂半透明那回事，见下面的降级分支。
+   */
+  background: var(--suggest-bg, var(--bg-search));
   box-shadow: var(--shadow-md);
 }
 
@@ -127,7 +141,12 @@ function style() {
 /* 不支持 backdrop-filter 时退化为不透明面板档位，不跳回别的配色 */
 @supports not (backdrop-filter: blur(1px)) {
   .suggest {
-    background: var(--surface-3);
+    /*
+     * 用户自定义色优先于不透明档：自定义色本就是不透明的，老浏览器上
+     * 同样认它；只有「未配自定义色」时才退回纯色面板，避免半透明磨砂面
+     * 在不支持模糊的浏览器上出现。
+     */
+    background: var(--suggest-bg, var(--surface-3));
   }
 }
 
@@ -158,9 +177,10 @@ function style() {
   transition: background-color var(--dur-fast) var(--ease);
 }
 
-/* 高亮用中性填充而非 accent：accent 只标二元状态，不标「当前所指」 */
+/* 高亮用中性填充而非 accent：accent 只标二元状态，不标「当前所指」
+ * 配了 `--suggest-active` 时用它，否则回落到主题的中性填充 */
 .suggest__item.is-active {
-  background: var(--fill-raised);
+  background: var(--suggest-active, var(--fill-raised));
 }
 
 .suggest__icon {
@@ -168,7 +188,7 @@ function style() {
   width: 14px;
   height: 14px;
   flex: none;
-  color: var(--color-text-faint);
+  color: var(--suggest-text, var(--color-text-faint));
   place-items: center;
 }
 
@@ -182,6 +202,8 @@ function style() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* 建议词走列表的文字色；配了自定义色就跟着换，否则沿用主题正文色 */
+  color: var(--suggest-text, var(--color-text));
 }
 
 /* 触屏下把行高提到 44px，与其余列表一致 */

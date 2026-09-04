@@ -91,3 +91,25 @@ export function writeCache(key: string, view: WeatherView): void {
 export function isStale(view: WeatherView, now = Date.now()): boolean {
   return now - view.fetchedAt >= TTL_MS
 }
+
+/**
+ * 清掉全部地点的缓存，供设置里的「重置为默认」调用。
+ *
+ * 缓存不是用户数据，本可以不管（TTL 一到自会刷新）。但重置会把方块换回默认那一个
+ * 地点，用户之前配过的城市从此再无入口，它们的缓存就成了永久孤儿——与
+ * settings.reset 里连 IndexedDB 的图片字节一起删是同一条纪律。
+ *
+ * 先收集再删：直接在遍历里 removeItem 会让后续下标整体前移，漏掉相邻的键。
+ */
+export function clearWeatherCache(): void {
+  try {
+    const keys: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key?.startsWith(STORAGE_PREFIX)) keys.push(key)
+    }
+    for (const key of keys) localStorage.removeItem(key)
+  } catch {
+    // 无痕模式下这些 API 会抛；缓存留着也只是多一次过期判定
+  }
+}

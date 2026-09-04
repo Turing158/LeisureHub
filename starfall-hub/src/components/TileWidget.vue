@@ -32,6 +32,13 @@ const emit = defineEmits<{
    * 校验在 store 那一侧由 sanitizeWidgetProps 统一做。
    */
   'update-props': [patch: Record<string, unknown>]
+  /**
+   * 组件请求打开自己的功能对话框（目前只有待办）。
+   *
+   * 与 update-props 一样只做转发，这一层不认识是哪个组件：浮层的宿主一律是
+   * TileGrid，方块自己挂模态会让每个方块各持一份对话框状态。
+   */
+  'open-widget-dialog': []
 }>()
 
 /**
@@ -60,14 +67,16 @@ const bindings = computed(() => ({
 
 <template>
   <!--
-    update-engine 只有搜索组件会发；用 @… 监听一个别的组件不声明的事件是安全的，
-    Vue 只是把它当普通的 attrs 落在根元素上而已（这些组件的根都是元素而非 Fragment）。
+    update-engine 只有搜索组件会发、open-todos 只有待办会发；用 @… 监听一个别的
+    组件不声明的事件是安全的，Vue 只是把它当普通的 attrs 落在根元素上而已
+    （这些组件的根都是元素而非 Fragment）。
   -->
   <component
     :is="def.component"
     v-if="def"
     v-bind="bindings"
     @update-engine="emit('update-props', { engineId: $event })"
+    @open-todos="emit('open-widget-dialog')"
   />
   <span v-else class="fallback" :title="`未知组件：${widgetId}`">{{ fallbackChar }}</span>
 </template>

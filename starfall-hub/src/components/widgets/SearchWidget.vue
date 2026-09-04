@@ -6,14 +6,16 @@
  * 配置存在 WidgetTile.props 里，由右键「编辑」进 Dialog 修改。
  * 所以桌面上可以放多个，各自用不同引擎。
  *
- * **它是唯一一个内部要吃掉指针的 widget。** 输入框需要 pointerdown 来定位光标与
- * 选中文本，而 TileCell 的 .tile-cell__square 上挂着 useDragSort 的 setPointerCapture。
- * 两者落在同一块区域上必然互斥，所以这个方块整体退出拖拽（判据在 TileCell 的
- * isInteractive），换位靠把别的方块拖过来挤位置、或在右键编辑框里改尺寸。
+ * **它是唯一一个要和拖拽状态机谈条件的 widget。** 输入框需要 pointerdown 来定位
+ * 光标与选中文本——选字本身就是一次按下-拖动，不可能与「拖走方块」共用同一条
+ * 手势。分工由 TileCell 判定（isInteractive 认 widgetId === 'search'）：
+ * 输入框上的按下整体让给浏览器；方块其余部分照常发起拖拽，但走「软启动」
+ * ——按下不立即 setPointerCapture，越过阈值才接管，否则引擎按钮与 chips 的
+ * 原生 click 会被捕获吃掉（机制见 useDragSort 的 StartContext.deferCapture）。
  *
  * 右键同样要分开：输入框上放行浏览器原生菜单（复制 / 粘贴 / 全选比自绘的
- * 「编辑 / 删除」有用得多），方块其余部分仍出自绘菜单——否则一个退出了拖拽的
- * 方块就再也没有任何配置入口。分界靠输入框上的 `data-native-menu`。
+ * 「编辑 / 删除」有用得多），方块其余部分仍出自绘菜单。分界靠输入框上的
+ * `data-native-menu`。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
@@ -30,6 +32,7 @@ import { useSuggest } from '@/composables/useSuggest'
 import { useSettingsStore } from '@/stores/settings'
 import { buildSearchUrl, SEARCH_SPAN_LIMITS as LIMITS } from '@/types/search'
 import { clampSpan } from '@/types/tile'
+import { isHexColor } from '@/utils/color'
 
 const props = defineProps<{
   /**
@@ -51,6 +54,26 @@ const props = defineProps<{
    * 但**照常渲染**，用户看到的仍是落格后的版式与引擎图标。
    */
   preview?: boolean
+  /** 方格底色；缺省沿用方格自身的玻璃底 */
+  bgColor?: string
+  /** 次要块面：上面一排引擎 chips、引擎键与清除钮的悬停底 */
+  subBgColor?: string
+  /** 主要文字：输入的内容、引擎键与清除钮的图标 */
+  textColor?: string
+  /** 次要文字：占位符、chips 名称、引擎 / 清除钮的次级文字 */
+  subTextColor?: string
+  /**
+   * 建议列表面板底色。
+   *
+   * 与方块本身的四个色档刻意分开：建议列表是 Teleport 到 body 的独立浮层
+   * （见 SuggestList 文件头），浮在桌面之上，跟方块的「主/次背景」不是同一面。
+   * 缺省沿用主题的搜索面板令牌（--bg-search）。其余两个是 it 的文字与高亮底色。
+   */
+  suggestBgColor?: string
+  /** 建议列表里的主要文字（建议词与搜索图标） */
+  suggestTextColor?: string
+  /** 建议列表里当前高亮那一项的底色 */
+  suggestActiveColor?: string
 }>()
 
 const settings = useSettingsStore()
@@ -58,10 +81,10 @@ const settings = useSettingsStore()
 /** 版式只由占格高度决定（宽度的影响交给 flex），像素换算仍全在 CSS 里 */
 const variant = computed(() => searchVariant(props.spanH))
 /**
- * 引擎按钮只在 h=1 画。
+ * 引擎按钮**两档都画**：它是输入框左侧那个可点的引擎锚点，点开出完整列表。
  *
- * 两档都摊开了 chips，但 h=1 那一档的 chips 不能换行、溢出时靠横向滚动而滚动条
- * 被藏起来，所以按钮留着当完整列表（理由详见 variant.ts 的 showsEngineToggle）。
+ * 曾只在 h=1 画、h=2 退成不可点的图标（理由详见 variant.ts 的 showsEngineToggle，
+ * 那里已翻案）。两档手势一致更省心——用户把方块拉高后，点左侧图标依然能动引擎。
  */
 const engineToggle = computed(() => showsEngineToggle(variant.value))
 /** h=2 多出来的那八十来像素给「最近搜索」 */
@@ -86,6 +109,49 @@ const chipsIconOnly = computed(
 const engine = computed(() => settings.resolveEngine(props.engineId))
 
 /**
+ * 颜色写成内联的 CSS 变量而非直接的 color / background，与日历 / 天气同构。
+ *
+ * 变量没被设上时，样式里的 `var(--sw-bg, <令牌>)` 自动回落到主题令牌，
+ * 「未配置」与「配成当前主题色」因此是两种状态——前者跟着主题走。
+ *
+ * 仍要过一遍 isHexColor：这些值来自持久化数据，store 已校验过，这里是第二道。
+ */
+const colorStyle = computed(() => {
+  const vars: Record<string, string> = {}
+  const set = (name: string, value: string | undefined) => {
+    if (isHexColor(value)) vars[name] = value
+  }
+  set('--sw-bg', props.bgColor)
+  set('--sw-sub-bg', props.subBgColor)
+  set('--sw-text', props.textColor)
+  set('--sw-sub-text', props.subTextColor)
+  return vars
+})
+
+/**
+ * 建议列表面板的颜色变量，与 colorStyle 同一条校验约定。
+ *
+ * 独立成一组而不是并进 colorStyle：两组变量落在不同的元素上——
+ * colorStyle 挂在方块的 .sw 上，建议列表是 Teleport 出去的浮层，只能由
+ * SuggestList 自己承接。单独挂也能让「方块色」与「列表色」在脑子里分开，
+ * 不把两套语义挤进同一个变量表。
+ *
+ * 以具名 prop 传给 SuggestList（见模板），SuggestList 把它和定位 rect 合并进
+ * 同一个 :style——不做 fallthrough 隐式继承，那样依赖 Vue 的根属性合并，
+ * 变量与定位中的坐标混在一起，后来人看不出哪份是哪份。
+ */
+const suggestStyle = computed(() => {
+  const vars: Record<string, string> = {}
+  const set = (name: string, value: string | undefined) => {
+    if (isHexColor(value)) vars[name] = value
+  }
+  set('--suggest-bg', props.suggestBgColor)
+  set('--suggest-text', props.suggestTextColor)
+  set('--suggest-active', props.suggestActiveColor)
+  return vars
+})
+
+/**
  * placeholder。
  *
  * 一律带上引擎名（`用百度搜索`）：那是这个方块与旁边那个搜索方块唯一的区别，
@@ -98,6 +164,7 @@ const engine = computed(() => settings.resolveEngine(props.engineId))
 const placeholder = computed(() => `用${engine.value.name}搜索`)
 
 const frameEl = ref<HTMLElement | null>(null)
+const rowEl = ref<HTMLElement | null>(null)
 const inputEl = ref<HTMLInputElement | null>(null)
 const toggleEl = ref<HTMLElement | null>(null)
 
@@ -109,6 +176,17 @@ const toggleEl = ref<HTMLElement | null>(null)
  * 不存原文的话，用户按两下 ↓ 再想改回自己打的字，那段文字已经没了。
  */
 const typed = ref('')
+
+/**
+ * 输入框此刻有没有内容，清除按钮的显隐跟着它走。
+ *
+ * input 的 value 不是响应式状态，总得有个东西替模板盯着。同步点只有两个：
+ * writeInput 收口所有程序写入（↑↓ 预览、选中项回填、Esc 还原都经它），
+ * onInput 收口所有用户编辑（含输入法上屏）。刻意不从 typed 派生：typed 是
+ * 「用户敲进去的原文」，与框里**显示**的内容是两份状态——预览与补全会多出
+ * 一截，按钮清的是显示出来的东西，就该跟着显示走。
+ */
+const hasContent = ref(false)
 
 /** 建议列表高亮项；-1 是「无选中」态，它必须存在于循环里（见 onKeydown） */
 const activeIndex = ref(-1)
@@ -164,15 +242,19 @@ const OPTION_PREFIX = `${uid}-opt`
 /* ── 弹层定位 ────────────────────────────────────────── */
 
 /**
- * 外框的实测矩形。
+ * 建议列表的锚，就锚在**输入行**上，而不是整个方块。
  *
- * 弹层的宽度硬绑这里的 width：方块可以是 2..4 格宽，而它还会被拖拽浮层、
- * Dialog 预览等场景缩放，写死任何数字都会在别的场景下错位。
+ * 建议是「输入框的下拉」，它该贴着输入行底缘展开；方块在 stack（h=2）档下面还有
+ * 一排「最近搜索」，若锚到整块外框，列表会落到记录区下方，像与输入失去关联。
+ * 所以这里测的是 .sw__row 的实测矩形——弹层跟着它走，宽也硬绑它的 width。
+ *
+ * 单测输入行还有一层好处：列表所在的面与输入行同宽，不会因为占格宽度不同而错位。
+ * 行宽随颗数（方块 2..4 格）与拖拽浮层缩放变化，写死任何数字都会在别的场景下错位。
  */
 const rect = ref({ left: 0, top: 0, bottom: 0, width: 0 })
 
 function measure() {
-  const el = frameEl.value
+  const el = rowEl.value
   if (!el) return
   const box = el.getBoundingClientRect()
   rect.value = { left: box.left, top: box.top, bottom: box.bottom, width: box.width }
@@ -182,7 +264,7 @@ let observer: ResizeObserver | null = null
 
 onMounted(() => {
   measure()
-  const el = frameEl.value
+  const el = rowEl.value
   if (el) {
     observer = new ResizeObserver(measure)
     observer.observe(el)
@@ -274,6 +356,7 @@ function writeInput(value: string) {
   if (!el) return
   el.value = value
   el.setSelectionRange(value.length, value.length)
+  hasContent.value = value.length > 0
 }
 
 /**
@@ -313,6 +396,22 @@ function leavePreview(): boolean {
   return true
 }
 
+/**
+ * 一键清除。
+ *
+ * 与 Esc 的「清空输入」分支同一套动作（typed、输入框、建议一起清），外加
+ * 收起列表：点击那一刻焦点还在输入框，列表可能正摊着。清完把焦点还回输入框
+ * ——清空几乎总是为了重新输入，与 chooseEngine 的处理一致。
+ * 预览态不必另设门禁：submit 与取数本来就被 live 挡住，清的只是个样子。
+ */
+function clearQuery() {
+  typed.value = ''
+  writeInput('')
+  suggest.clear()
+  closeList()
+  inputEl.value?.focus()
+}
+
 /* ── 事件 ────────────────────────────────────────────── */
 
 /**
@@ -333,6 +432,7 @@ function onInput(event: Event) {
   inline.noteInput(event)
   const el = event.target as HTMLInputElement
   typed.value = el.value
+  hasContent.value = el.value.length > 0
   // 兜一道：beforeinput 已经把预览态退掉了，这里只保证状态一致
   activeIndex.value = -1
 
@@ -535,14 +635,13 @@ watch(
   <!--
     输入框上的 data-native-menu：useContextMenu 的 resolve 见到它就返回 null，
     放行浏览器原生右键菜单——复制 / 粘贴 / 全选比自绘的「编辑 / 删除」有用得多。
-    方块的其余部分（外框留白、引擎图标、chips）不带这个标记，右键仍出编辑菜单，
-    否则一个退出了拖拽的方块就再也没有配置入口了。
+    方块的其余部分（外框留白、引擎图标、chips）不带这个标记，右键仍出编辑菜单。
 
-    退出拖拽这件事由 TileCell 判定（isInteractive 认 widgetId === 'search'），
-    这里不需要额外标记。
+    拖拽的分工同样由 TileCell 判定（isInteractive 认 widgetId === 'search'）：
+    输入框上的按下让给浏览器，其余部分软启动拖拽，这里不需要额外标记。
   -->
-  <div ref="frameEl" class="sw" :class="`sw--${variant}`">
-    <div class="sw__row">
+  <div ref="frameEl" class="sw" :class="`sw--${variant}`" :style="colorStyle">
+    <div ref="rowEl" class="sw__row">
       <button
         v-if="engineToggle"
         ref="toggleEl"
@@ -556,15 +655,7 @@ watch(
       >
         <EngineIcon :name="engine.icon" />
       </button>
-
-      <!--
-        h=2 不给按钮，只留一个不可点的图标当前缀。
-        那一档的 chips 会换行并在内部滚动，全部引擎都够得着，按钮就成了
-        同一个选择的第二处入口。h=1 的 chips 不能换行，所以那一档留着按钮。
-      -->
-      <span v-else class="sw__mark" aria-hidden="true">
-        <EngineIcon :name="engine.icon" />
-      </span>
+      <!-- 引擎按钮两档都画（见 engineToggle），这里不剩不可点的图标分支 -->
 
       <input
         ref="inputEl"
@@ -587,6 +678,30 @@ watch(
         @compositionend="inline.onCompositionEnd"
         @focusout="onFocusOut"
       />
+
+      <!--
+        一键清除。只有框里有内容才渲染（显隐见 hasContent）——v-if 而不是
+        v-show 加过渡：它跟着打字节奏一闪一灭，退场动画只会让人等。
+
+        手势与引擎按钮同一条分工：按住拖走是软启动拖拽，原地松手是原生 click
+        （见文件头）。右键也不带 data-native-menu，与引擎按钮一样出自绘菜单。
+      -->
+      <button
+        v-if="hasContent"
+        class="sw__clear"
+        type="button"
+        aria-label="清空搜索内容"
+        @click="clearQuery"
+      >
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            stroke="currentColor"
+            stroke-linecap="round"
+            stroke-width="1.8"
+            d="M6 6l12 12M18 6L6 18"
+          />
+        </svg>
+      </button>
     </div>
 
     <!--
@@ -634,6 +749,7 @@ watch(
         :rect="rect"
         :list-id="LIST_ID"
         :id-prefix="OPTION_PREFIX"
+        :suggest-style="suggestStyle"
         @pick="onPick"
         @hover="onHover"
       />
@@ -676,6 +792,16 @@ watch(
   padding: var(--sw-pad);
   gap: var(--sw-pad);
   border-radius: inherit;
+  /*
+   * 卡片背景走「主要背景」档；未配置时保持透明，透出方格自身的玻璃底——
+   * 与日历 / 天气的 --cal-bg / --wx-bg 同一套回落契约。
+   */
+  background: var(--sw-bg, transparent);
+  /*
+   * 方块已可整体拖拽，从留白起手的拖动不该顺带选中沿途的文字
+   * （chips 名、记录词、标题）。输入框要选字，单独放开。
+   */
+  user-select: none;
 }
 
 /*
@@ -692,7 +818,8 @@ watch(
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--r-full);
-  background: var(--fill);
+  /* 输入行是浮在卡片上的次级面板：卡片走主要背景，这一行走次要背景 */
+  background: var(--sw-sub-bg, var(--fill));
   transition: border-color var(--dur-fast) var(--ease);
 }
 
@@ -702,46 +829,34 @@ watch(
 }
 
 /*
- * 引擎按钮 / 图标。
+ * 引擎按钮。
  *
- * 尺寸按短边缩，与输入框同高，两者因此在圆角胶囊里居中成一行。
+ * 悬停底色**铺满左侧整段**，而不只是那颗图标：按钮 stretch 到输入行的满高，
+ * 左缘贴输入行，右缘顶到输入框的 border-left 分隔线——hover 时从行的左侧圆角
+ * 到分隔线这一整段都是高亮面（圆角由 .sw__row 的 radius + overflow: hidden 裁掉）。
+ * 图标仍按宽 clamp 出的短边居中，不进歧义：命中区也随满高变大。
  */
-.sw__engine,
-.sw__mark {
-  display: grid;
-  width: clamp(22px, calc(var(--sw-size) * 0.4), 32px);
-  height: clamp(22px, calc(var(--sw-size) * 0.4), 32px);
-  flex: none;
-  border-radius: var(--r-full);
-  color: var(--color-text-dim);
-  place-items: center;
-}
-
-.sw__engine svg,
-.sw__mark svg {
-  width: 60%;
-  height: 60%;
-}
-
 .sw__engine {
   position: relative;
+  display: grid;
+  align-self: stretch;
+  width: clamp(22px, calc(var(--sw-size) * 0.4), 32px);
+  flex: none;
+  color: var(--sw-text, var(--color-text-dim));
+  place-items: center;
   transition:
     background-color var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);
 }
 
-/*
- * 视觉尺寸之外把命中区域补到 44px。
- * 与 SettingsDrawer 的 .close::after 同一个手法（那里是 34px 视觉 + inset: -5px）。
- */
-.sw__engine::after {
-  position: absolute;
-  content: '';
-  inset: -6px;
+.sw__engine svg {
+  width: 60%;
+  height: 60%;
 }
 
 .sw__engine:hover {
-  background: var(--fill-raised);
+  /* hover 高亮面走次要背景：chips、悬停块同属 sub-bg 语义 */
+  background: var(--sw-sub-bg, var(--fill-raised));
   color: var(--color-text);
 }
 
@@ -764,13 +879,61 @@ watch(
   border: none;
   border-left: 1px solid var(--line-subtle);
   background: none;
+  color: var(--sw-text, var(--color-text));
   font-size: clamp(11px, calc(var(--sw-size) * 0.17), 15px);
   /* 外框已经给了聚焦描边，输入框自己再来一道会是两层框 */
   outline: none;
+  /* 方块整体 user-select: none（见 .sw），选字是输入框的本职，在这里放开 */
+  user-select: text;
 }
 
 .sw__input::placeholder {
-  color: var(--color-text-faint);
+  /* 占位符是次级文字：配了 sub-text 就跟着换，否则回落主题 */
+  color: var(--sw-sub-text, var(--color-text-faint));
+}
+
+/*
+ * 清除按钮。
+ *
+ * 尺寸、悬停底色、命中区补法照抄引擎按钮——同一行里的两个圆钮该长一个样，
+ * 图标比例（60%）也与 .sw__engine svg 对齐。不画分隔线：它是输入框自己的
+ * 清除缀（浏览器搜索框里那个 × 的身份），不是与引擎按钮平级的第三个分区；
+ * 显隐由 v-if 决定，出现时输入框的 flex: 1 自然让出这一份宽度。
+ */
+.sw__clear {
+  position: relative;
+  display: grid;
+  width: clamp(22px, calc(var(--sw-size) * 0.4), 32px);
+  height: clamp(22px, calc(var(--sw-size) * 0.4), 32px);
+  flex: none;
+  border-radius: var(--r-full);
+  color: var(--sw-text, var(--color-text-dim));
+  place-items: center;
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+.sw__clear svg {
+  width: 60%;
+  height: 60%;
+}
+
+/* 视觉尺寸之外把命中区域补到 44px，与 .sw__engine::after 同一个手法 */
+.sw__clear::after {
+  position: absolute;
+  content: '';
+  inset: -6px;
+}
+
+.sw__clear:hover {
+  background: var(--sw-sub-bg, var(--fill-raised));
+  color: var(--color-text);
+}
+
+.sw__clear:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
 }
 
 /* ── 各版式的局部取舍 ───────────────────────────────── */
@@ -778,8 +941,9 @@ watch(
 /*
  * bar（h=1）：75px 里塞两条带，每一个像素都得算出来。
  *
- * 账目。h=1 的 --sw-size 恒为 75（square-h 是 75，square-w 至少 170，取短边），
- * 所以**这一档所有宽度同账**，2×1 与 6×1 的垂直排布逐像素相同：
+ * 账目按最紧的那一种算——**起了名字的方块**，可用高 75（square-h 是 75，
+ * square-w 至少 170，--sw-size 取短边得 75）。这一档所有宽度同账，
+ * 2×1 与 6×1 的垂直排布逐像素相同：
  *   可用高          75
  *   上下内边距      5 × 2   = 10
  *   一道缝          4
@@ -787,7 +951,13 @@ watch(
  *   chips           紧凑档 min-height 22
  *   合计 10 + 4 + 32 + 22 = 68，余 7 由 justify-content: center 分到上下。
  *
- * 所以内边距与缝**不能沿用 --sw-pad**（这一档解析为 10.5px，上下加缝就是 31.5px，
+ * **没起名字的方块这一档是 101px**：方格长到名称行的位置（见 TileCell 的
+ * --label-block），--sw-size 随之变成 101，几个 clamp() 各跳一档——输入框字号
+ * 12.75 → 15px、引擎按钮 30 → 32px。但上面那份账的总高不变（输入行高度在这一档
+ * 写死 30px，不吃 clamp），余量从 7 涨到 33，仍由 center 分到上下。
+ * 两种高度都装得下，无名那一档只是字大一号、留白多一些。
+ *
+ * 所以内边距与缝**不能沿用 --sw-pad**（有名那一档解析为 10.5px，上下加缝就是 31.5px，
  * 剩 43.5px 装不下 32 + 22）。这一档改用给死的小值。
  *
  * 也因此这一档**不再是「整块方格就是搜索框」**。此前输入行铺满方格、不画自己的面，
@@ -808,9 +978,10 @@ watch(
 /*
  * 输入行在这一档矮一档。
  *
- * clamp 的中项按 --sw-size（75）算出 31.5px，与上面那份账一致，这里只把它写死：
- * 那个 clamp 是给「短边随格宽变化」的档位用的，而 h=1 的短边恒定，
- * 留着一个算出来永远是同一个数的公式，只会让下一个人以为它还会变。
+ * clamp 的中项按有名那一档的 --sw-size（75）算出 31.5px，与上面那份账一致，
+ * 这里把它写死：那个 clamp 是给「短边随格宽变化」的档位用的，而这一档的短边只有
+ * 75（有名）与 101（无名）两种，写死之后两者的输入行同高——否则无名那一档会
+ * clamp 到 38px，与上面那份账不再对得上。
  */
 .sw--bar .sw__input {
   height: 30px;

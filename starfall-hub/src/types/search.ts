@@ -1,27 +1,33 @@
 /**
  * 搜索方块的占格范围。
  *
- * 与其余方块（1..SPAN_MAX，即 1..4）刻意不同，三个数各有理由：
+ * 与其余方块（1..SPAN_MAX，即 1..4）刻意不同：宽下限与高度上下限是常数，
+ * 宽上限跟随当前网格列数，各有理由——
  *
  * - **宽下限 2**（170px）。1 格是 75px，引擎按钮与输入框并排后输入框只剩 20px，
  *   放不下两个字符；退化成「只有输入框」也仍然是个连提示语都写不下的窄条。
  *   与其保留一个不可用的档位，不如让它进不去。2 格本身也已经是引擎 chips 要
  *   收成只有图标的宽度（见 SearchWidget 的 chipsIconOnly，实测差 74px）。
- * - **宽上限 6**（550px）。一个单行输入框还能保持可读行长的上限；再宽，光标与
- *   文字起点的距离已超出视觉扫视范围。这也是 `AddTileDialog` 面板宽度（560px）
- *   那一档，「搜索框与弹窗视觉上成一列」的意图仍成立。
+ * - **宽上限跟随当前网格列数**（tile.ts 的 gridCols，grid store 在 load /
+ *   resize 时同步）。搜索框是「宽度即可用性」的方块，能占多宽由桌面有多少列
+ *   决定——缺省网格是 15 列，窄屏上 autoFit 会解出更少列，静态常数给不出正确
+ *   的答案，上限就是网格本身。可读行长的顾虑仍在——超过 6 格（550px）后，
+ *   光标与文字起点的距离已超出视觉扫视范围——但那是版式偏好，编辑框把档位
+ *   摊开了，选多宽交给用的人自己掂量。下面 wMax 的 15 只是缺省网格下的初值，
+ *   运行时以 tile.ts 的 capWidthToGrid 覆写为准；它刻意写成字面量而不是
+ *   import DEFAULT_GRID_COLS——tile.ts 正 import 本文件，反向引用会成环。
  * - **高上限 2**（196px）。输入框恒定不到 40px 高，两档已经把多出来的空间用尽：
  *   h=1 是「输入行 + 一行紧凑 chips」（75px 里排到 68px，见 SearchWidget 的账），
  *   h=2 再加一块「最近搜索」。再高只是留白，而一个 317px 高的搜索框不是任何人
  *   想要的东西。
  *
- * 这些数字**不通过提高 SPAN_MAX 来实现**。那样会连带三处后果：TabCustom 的链接
+ * 这些常数**不通过提高 SPAN_MAX 来实现**。那样会连带三处后果：TabCustom 的链接
  * 尺寸控件从 4 档变 6 档（8 列网格里 5×5、6×6 的方块几乎没有意义）；
  * calendar/variant.ts 与 weather/variant.ts 那两张「八个分支对 16 种形状完备且
  * 互斥」的判定表失效，要按 36 种形状重推；grid.ts 的推挤在超大方块下更容易走到
  * reflow 兜底。所以改成「按 widgetId 给一组独立上下限」，见 types/tile.ts。
  */
-export const SEARCH_SPAN_LIMITS = { wMin: 2, wMax: 6, hMin: 1, hMax: 2 } as const
+export const SEARCH_SPAN_LIMITS = { wMin: 2, wMax: 15, hMin: 1, hMax: 2 } as const
 
 /** 结果页地址里的查询占位符 */
 export const QUERY_TOKEN = '{q}'

@@ -128,6 +128,17 @@ const fullText = computed(
   --cal-w: var(--square-w, var(--content-size, var(--tile-size)));
   --cal-h: var(--square-h, var(--content-size, var(--tile-size)));
   --cal-size: var(--content-size, var(--tile-size));
+  /*
+   * 「今天」高亮块的圆角，八个版式共用一处。
+   *
+   * 单位是 em 而不是 --r-sm 那一档的像素：今日块在 split 里约 29×27、
+   * 在 month 里约 50×40，同一个像素值在前者会显得太圆。写成 em 后
+   * 它在每个使用点各自按当地字号解析（未注册的自定义属性是按 token 原样
+   * 代入的，em 到 border-radius 那里才算），于是各版式自动等比。
+   *
+   * 0.3em 落在 3..7px：明确是圆角矩形，既不是胶囊也不是直角。
+   */
+  --cal-active-radius: 0.3em;
 
   /* .sr-only 是绝对定位的，没有定位祖先时会逃到初始包含块（Dialog 预览里就没有） */
   position: relative;
