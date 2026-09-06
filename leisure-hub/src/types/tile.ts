@@ -1,6 +1,7 @@
 import { ref } from 'vue'
 
 import { SEARCH_SPAN_LIMITS } from './search'
+import { activePresetDef } from '@/utils/profileKey'
 
 /** 方格内容的种类，决定渲染方式与后续可编辑字段 */
 export type TileKind = 'link' | 'widget'
@@ -9,19 +10,28 @@ export type TileKind = 'link' | 'widget'
 export const SPAN_MAX = 4
 
 /**
- * 缺省网格的行列数。
+ * 缺省网格的行列数，**按当前配置档的预设取**。
  *
  * 三处共用这一对数：stores/grid 的初始行列、下面宽度上限的初值、
  * 以及 data/defaults.ts 那份默认布局的槽位下标折算——**后者要求它们必须一致**，
  * 锚点 20 在 15 列下是「第 1 行第 5 列」，改了列数就落到别的格子上。
  *
- * 取 15×6 而不是更小的数，是为了与默认设置里的 1440×720 相符
- * （见 stores/settings 的 DEFAULTS.areaWidth）：`fitCount` 按 75+20 与 101+20
- * 反解正好是 15 与 6，于是首帧未量到尺寸时的初始网格与量完之后完全一致，
- * 不会先渲染一个小网格再重排一次。
+ * 电脑档取 15×6 是为了与它的 1440×720 相符（见 stores/settings 的 DEFAULTS.areaWidth）：
+ * `fitCount` 按 75+20 与 101+20 反解正好是 15 与 6，于是首帧未量到尺寸时的初始网格
+ * 与量完之后完全一致，不会先渲染一个小网格再重排一次。手机档取 3 列并走 cell 档，
+ * 那边的互解更简单（cell 档不做反解），两档的算术都写在 types/profile 的预设表里。
+ *
+ * 从常量改成函数是因为它现在依赖「当前是哪一档」：写成常量就会在模块求值那一刻
+ * 定格，而那时索引可能还没读。函数每次现取，profileKey 内部有缓存，代价是一次
+ * Map 查找。
  */
-export const DEFAULT_GRID_COLS = 15
-export const DEFAULT_GRID_ROWS = 6
+export function defaultGridCols(): number {
+  return activePresetDef().cols
+}
+
+export function defaultGridRows(): number {
+  return activePresetDef().rows
+}
 
 /** 一种内容允许的占格范围，两轴独立 */
 export interface SpanLimits {
@@ -48,8 +58,11 @@ export const DEFAULT_SPAN_LIMITS: SpanLimits = {
  * 赋值的两处旁边各调一次 setGridCols，且必须赶在 load 里 sanitizeTile 夹取
  * 存档之前），其余消费方只读。做成 ref 而不是裸变量是给编辑表单用的：
  * 抽屉开着时列数变了，档位列表要跟着重算。
+ *
+ * 初值现取当前档的列数：手机档是 3，未经 grid store 同步的那一小段时间里
+ * （模块求值到 store setup 之间）读到的上限也该是 3 而不是 15。
  */
-const gridCols = ref(DEFAULT_GRID_COLS)
+const gridCols = ref(defaultGridCols())
 
 /** grid store 同步列数的唯一入口；非正整数一律忽略，保持上一个合法值 */
 export function setGridCols(cols: number): void {

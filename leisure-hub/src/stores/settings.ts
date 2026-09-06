@@ -14,6 +14,13 @@ import {
   LOCAL_IMAGE_MAX_BYTES,
 } from '@/utils/imageStore'
 import { ENGINE_NAME_MAX, isSafeEngineUrl, type CustomEngine } from '@/types/search'
+import {
+  activePresetDef,
+  activeProfileId,
+  globalKey,
+  keyFor,
+  scanProfileKeys,
+} from '@/utils/profileKey'
 
 /** 背景来源：纯色预设 / 本地图片 / 网络图片 */
 export type BgMode = 'color' | 'local' | 'image'
@@ -26,7 +33,30 @@ export type DrawerSide = 'left' | 'right'
 /** 方块区域尺寸的给定方式：直接写像素 / 写横竖格子数 */
 export type AreaMode = 'pixel' | 'cell'
 
-const STORAGE_KEY = 'starfall-hub:settings'
+/**
+ * 两份存档，一个 store。
+ *
+ * 内存里仍是一个 settings store、二十来个 ref；只有 load() / persist() 知道
+ * 它们落进两个键：
+ *
+ *   `leisure-hub:settings@<active>`  按档：背景、主题色、遮罩、区域尺寸、抽屉侧、手柄高度
+ *   `leisure-hub:global`             全局：隐私三开关 + 自定义引擎表
+ *
+ * **拆存档，不拆 store。** 把它拆成两个 store 会波及 2420 行抽屉里每一处
+ * `settings.suggestEnabled`，而那两组字段在内存里没有任何理由分开——存档布局是
+ * 持久化层的知识，不该漏进消费方。
+ *
+ * 那四个字段为什么必须全局：三条隐私开关按档存等于「在电脑档关掉了搜索建议，
+ * 切到手机档又默默打开了」，用户以为关掉的东西又开始往第三方发字；
+ * `customEngines` 是所有搜索方块共用的词典，而每个方块把 engineId 存在自己的
+ * props 里，按档存会让另一档那些方块的 id 集体悬空、resolveEngine 静默回退，
+ * 表现是「手机档的搜索方块自己换了引擎」且找不到原因。
+ */
+function settingsKey(): string {
+  return keyFor('settings')
+}
+
+const GLOBAL_KEY = globalKey('global')
 const SCHEMA_VERSION = 1
 
 /**
@@ -132,6 +162,19 @@ export const CUSTOM_ENGINE_MAX = 12
 /** 遮罩压暗层不透明度的滑块范围，单位为百分比 */
 export const SCRIM_OPACITY_MIN = 20
 export const SCRIM_OPACITY_MAX = 95
+
+/**
+ * 设置手柄的纵向位置。
+ *
+ * 常量与夹取放在这里而不是 useEdgeHandle，是因为这个值现在**存在 settings 存档里**
+ * （曾经独占一份 `starfall-hub:settings-handle`）。那份存档是唯一在**模块求值时**
+ * 就读按档键的地方，多配置档之后它会在索引就绪之前跑——并进来之后，
+ * 「按档的键一律在 store setup 里读」这条纪律就没有例外了。
+ *
+ * 留白 8%：沿边线方向两端各让出一段，避免手柄贴到屏幕角落。
+ */
+export const HANDLE_INSET = 0.08
+export const HANDLE_RATIO_DEFAULT = 0.5
 
 /*
  * 单张本地图片的大小上限，从 utils/imageStore 转出。
@@ -270,23 +313,8 @@ const DEFAULTS = {
   drawerSide: 'right' as DrawerSide,
   /** 点遮罩关闭：默认开启，与改造前写死的行为一致 */
   closeOnScrim: true,
-  areaMode: 'pixel' as AreaMode,
-  /*
-   * 尺寸默认 1440×720，两个格子档留空跟随。
-   *
-   * 不再全为 AREA_AUTO：AUTO 会按实际视口反解行列，于是**默认布局在不同屏幕上
-   * 落位不同**——15 列放不下时那些方块会被 resize 挤进 overflow 暂存，
-   * 首次打开看到的就不是 data/defaults.ts 画的那张图了。
-   * 写死一档与 DEFAULT_GRID_COLS/ROWS 恰好互解（见那里的注释），
-   * 首帧与量完之后一致；屏幕更大时四周留白居中，更小时可横竖滚动。
-   *
-   * 两个格子档仍留 AUTO：它们只在 areaMode === 'cell' 时参与计算，
-   * 预填一份等于替用户决定另一档的值。
-   */
-  areaWidth: 1440,
-  areaHeight: 720,
-  areaCols: AREA_AUTO,
-  areaRows: AREA_AUTO,
+  /** 手柄纵向位置：正中。停靠侧是上面的 drawerSide，两者一起重置 */
+  handleRatio: HANDLE_RATIO_DEFAULT,
   /*
    * 搜索建议默认**开启**。
    *
@@ -301,6 +329,8 @@ const DEFAULTS = {
    *
    * 放在全局而不是每个方块的 props 里：它是一条隐私开关，
    * 「这个方块发、那个方块不发」没有意义，只会让用户以为自己已经关掉了。
+   * 也放在**全局存档**而不是按档的那份里，同一条理由推到配置档：
+   * 「在电脑档关掉了，切到手机档又默默打开了」比「方块之间不一致」严重一档。
    */
   suggestEnabled: true,
   /** 内联补全默认关闭：它与中文输入法的边界最窄，见 useInlineComplete 的四道门禁 */
@@ -317,12 +347,44 @@ const DEFAULTS = {
 }
 
 /**
+ * 方块区域尺寸的默认值，**按当前配置档的预设取**。
+ *
+ * 曾经是 DEFAULTS 里写死的四个数（pixel 1440×720 + 两个 AREA_AUTO）。改成按预设
+ * 取是这次多配置档的核心一步：它必须与网格行列**互解**，否则首帧按预设摆好的
+ * 布局会被 TileGrid 的 resize watch 挪一遍（缩小时方块被挤进 overflow，等网格
+ * 变回来它们已经按 reflow 顺序重排了，回不到原来的锚点）。两档各自的算术与
+ * 互解检查都写在 types/profile 的预设表里。
+ *
+ * 电脑档仍是 pixel 1440×720（与 15×6 互解，屏幕更大时四周留白居中）；
+ * 手机档是 cell 3×N——**rows 写死而不留 AREA_AUTO**，与电脑档写死像素同一条理由：
+ * AUTO 会按实际视口反解，于是默认布局在不同手机上落位不同，短屏反解出 5 行，
+ * 第 6 行往后的方块全被 resize 挤进 overflow，首次打开看到的就不是设计好的那张图。
+ */
+function areaDefaults() {
+  const { area } = activePresetDef()
+  return {
+    areaMode: area.mode as AreaMode,
+    areaWidth: area.width,
+    areaHeight: area.height,
+    areaCols: area.cols,
+    areaRows: area.rows,
+  }
+}
+
+/**
  * 本地图片在存档里的形态：只有索引，没有字节。
  *
  * 运行期的 BgLocalImage 多一个 url（objectURL），它不能持久化——见该接口的注释。
  */
 type StoredLocalImage = Pick<BgLocalImage, 'id' | 'name'>
 
+/**
+ * 按档那份存档的形状（`leisure-hub:settings@<id>`）。
+ *
+ * 搜索那四个字段仍留在这里、标成**旧字段**：它们已经搬去 `:global`，但老存档
+ * （无后缀的 `:settings`，被 profileKey 的 claimLegacy 改名成 `@desktop`）里还带着，
+ * 读盘时要能从它们迁一次。写入侧不再写。与 bgColor / bgImage 那几个旧字段同一手法。
+ */
 interface SettingsState {
   version: number
   bgMode: BgMode
@@ -331,7 +393,7 @@ interface SettingsState {
   bgUrls: BgUrlItem[]
   bgRotate: Record<BgMode, boolean>
   bgInterval: Record<BgMode, number>
-  /** 关着轮换时选中的那一帧的 key，按档各存一个 */
+  /** 关着轮换时选中的那一帧的 key，按背景档各存一个 */
   bgPick: Record<BgMode, string>
   bgBlur: number
   /* ↓ 旧字段：只在读盘时用于迁移，不再写入 */
@@ -345,11 +407,23 @@ interface SettingsState {
   scrimOpacity: number
   drawerSide: DrawerSide
   closeOnScrim: boolean
+  /** 手柄纵向位置，0..1。曾独占 `starfall-hub:settings-handle`，见 HANDLE_RATIO_DEFAULT */
+  handleRatio: number
   areaMode: AreaMode
   areaWidth: number
   areaHeight: number
   areaCols: number
   areaRows: number
+  /* ↓ 已搬去 :global，只在读盘时用于迁移，不再写入 */
+  suggestEnabled?: boolean
+  inlineCompleteEnabled?: boolean
+  searchHistoryEnabled?: boolean
+  customEngines?: CustomEngine[]
+}
+
+/** 全局那份存档的形状（`leisure-hub:global`），四个字段一律跨档共用 */
+interface GlobalState {
+  version: number
   suggestEnabled: boolean
   inlineCompleteEnabled: boolean
   searchHistoryEnabled: boolean
@@ -550,6 +624,113 @@ function sanitizeCustomEngine(value: unknown): CustomEngine | null {
   }
 }
 
+function sanitizeEngineList(value: unknown): CustomEngine[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map(sanitizeCustomEngine)
+    .filter((engine): engine is CustomEngine => engine !== null)
+    .slice(0, CUSTOM_ENGINE_MAX)
+}
+
+/** 手柄比例：两端各留 HANDLE_INSET，非数字回到正中 */
+function clampHandleRatio(value: unknown): number {
+  if (!Number.isFinite(value as number)) return HANDLE_RATIO_DEFAULT
+  return Math.min(1 - HANDLE_INSET, Math.max(HANDLE_INSET, value as number))
+}
+
+/**
+ * 认领手柄高度曾独占的那份存档（`starfall-hub:settings-handle`，裸对象 `{ ratio }`）。
+ *
+ * 读到就**顺手删掉**：这是一次性迁移，留着旧键会让「下次读盘该信谁」变成一个
+ * 每次启动都要回答的问题。它是全局键（无 `@` 后缀），所以第一个打开的档把它
+ * 领走——旧版本只有一个手柄位置，本来也只有一个答案。
+ *
+ * 与 claimLegacy（profileKey）分工：那边只搬原始字节、不解析内容，而这里必须
+ * 解析（旧形状是 `{ ratio }`，新位置是 settings 存档里的一个字段），
+ * 所以放在知道存档形状的这一侧。
+ *
+ * JSON 坏掉时不删键（catch 里没有 removeItem）：那一个字节数的垃圾键不值得
+ * 再包一层 try，而它已经不影响任何读取。
+ */
+function claimLegacyHandleRatio(): number | null {
+  try {
+    const key = globalKey('settings-handle')
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { ratio?: number }
+    localStorage.removeItem(key)
+    return Number.isFinite(parsed?.ratio) ? clampHandleRatio(parsed.ratio) : null
+  } catch {
+    return null
+  }
+}
+
+/* ── 本地壁纸字节的跨档引用 ─────────────────────────── */
+
+/**
+ * **所有**配置档引用到的本地图 id。
+ *
+ * 这个函数存在的理由是一个只等多档出现就触发的不可逆 bug：孤儿清理原先用
+ * 「当前档的 bgLocalImages」当 alive 集合，多档之后**打开电脑档就会删掉手机档的
+ * 全部壁纸字节**——8MB 的照片，没有回收站，下次进手机档只剩一句「图没了」
+ * （hydrate 会把读不到字节的索引项一并丢掉）。
+ *
+ * 扫一遍 localStorage 里所有 `leisure-hub:settings@` 前缀的键，各自取
+ * `bgLocalImages[].id`。存档都很小，一次启动扫一遍的成本可忽略。
+ * 「两档引用同一个 id」不是假设——「复制当前配置」会真的产出这种状态，
+ * 没有这层检查，从副本里删掉一张壁纸会把原档的那张一起删掉。
+ *
+ * 入参 `overrides` 让调用方用**内存里的最新值**覆盖某一档的存档快照：删图与
+ * reset 都是先改内存再落盘，此刻读盘拿到的是改之前的那一份，会把正要删的 id
+ * 算成「仍被引用」而永远删不掉字节。
+ *
+ * **天气缓存刻意不做这套**：它按坐标缓存、可再生且有 TTL，为一份 15 分钟后自会
+ * 刷新的数据引入引用计数是白付。判据是「字节不可再生，缓存可以」。
+ */
+function referencedImageIds(overrides?: Map<string, string[]>): Set<string> {
+  const alive = new Set<string>()
+  for (const { id, key } of scanProfileKeys('settings')) {
+    const override = overrides?.get(id)
+    if (override) {
+      for (const imageId of override) alive.add(imageId)
+      continue
+    }
+    try {
+      const raw = localStorage.getItem(key)
+      if (!raw) continue
+      const parsed = JSON.parse(raw) as Partial<SettingsState>
+      if (!Array.isArray(parsed?.bgLocalImages)) continue
+      for (const item of parsed.bgLocalImages) {
+        if (item && typeof item === 'object' && typeof item.id === 'string' && item.id) {
+          alive.add(item.id)
+        }
+      }
+    } catch {
+      /*
+       * 读不出来的那一档按「引用了未知内容」处理——继续，不把它的图算进 alive。
+       *
+       * 反过来（整个清理放弃）更糟：一份坏掉的存档会让孤儿永远清不掉。
+       * 而漏算的代价有限：那一档本来也读不出自己的索引项。
+       */
+      continue
+    }
+  }
+  return alive
+}
+
+/** 删掉没有任何档引用的字节。overrides 的含义见 referencedImageIds */
+async function pruneOrphanImages(overrides?: Map<string, string[]>): Promise<void> {
+  const alive = referencedImageIds(overrides)
+  for (const id of await listImageIds()) {
+    if (!alive.has(id)) await deleteImage(id)
+  }
+}
+
+/** 删档之后清一次：那一档的存档键已经没了，它独占的字节就成了孤儿 */
+export async function pruneImagesAfterProfileRemoval(): Promise<void> {
+  await pruneOrphanImages()
+}
+
 export const useSettingsStore = defineStore('settings', () => {
   const bgMode = ref<BgMode>(DEFAULTS.bgMode)
   /** 纯色档的颜色组；至少一项，见 sanitizeColors */
@@ -603,18 +784,31 @@ export const useSettingsStore = defineStore('settings', () => {
   const drawerSide = ref<DrawerSide>(DEFAULTS.drawerSide)
   /** 点击遮罩空白处是否关闭浮层（设置抽屉与对话框共用） */
   const closeOnScrim = ref<boolean>(DEFAULTS.closeOnScrim)
+  /**
+   * 设置手柄的纵向位置，0..1。
+   *
+   * 从 useEdgeHandle 的模块级 ref 搬进来（连它那份独立存档一起）。搬家的收益有两层：
+   * 「重置为默认」少写一份存档，且这里不再有任何在**模块求值时**读按档键的地方——
+   * 那是多配置档下唯一会早于索引就绪的读盘。停靠侧仍是上面的 drawerSide，
+   * 拖动手柄时两者一起改。
+   */
+  const handleRatio = ref<number>(DEFAULTS.handleRatio)
 
   /*
    * 方块区域尺寸。
    *
    * 两档共存而不是二选一存一份：用户在 tab 间来回切换时，
    * 另一档的输入不该被清空。areaMode 只决定「哪一档参与计算」。
+   *
+   * 初值按当前配置档的预设取（见 areaDefaults）：手机档进来就是 cell 3×N，
+   * 与它那张 3 列播种表互解。
    */
-  const areaMode = ref<AreaMode>(DEFAULTS.areaMode)
-  const areaWidth = ref<number>(DEFAULTS.areaWidth)
-  const areaHeight = ref<number>(DEFAULTS.areaHeight)
-  const areaCols = ref<number>(DEFAULTS.areaCols)
-  const areaRows = ref<number>(DEFAULTS.areaRows)
+  const initialArea = areaDefaults()
+  const areaMode = ref<AreaMode>(initialArea.areaMode)
+  const areaWidth = ref<number>(initialArea.areaWidth)
+  const areaHeight = ref<number>(initialArea.areaHeight)
+  const areaCols = ref<number>(initialArea.areaCols)
+  const areaRows = ref<number>(initialArea.areaRows)
 
   /*
    * 搜索。
@@ -624,6 +818,9 @@ export const useSettingsStore = defineStore('settings', () => {
    * 一个百度一个 Google。这里留下的都是「不该逐方块分裂」的东西：
    * 建议与补全是隐私 / 输入法取舍，搜索记录是一份属于用户的记录（三个方块该看到
    * 同一份），自定义引擎表是所有方块共用的词典。
+   *
+   * 这四个字段落进 `:global` 而不是按档那份存档，理由同上再推一层：
+   * 「不该逐方块分裂」的东西也不该逐配置档分裂。见文件头 settingsKey 那段。
    */
   const suggestEnabled = ref<boolean>(DEFAULTS.suggestEnabled)
   const inlineCompleteEnabled = ref<boolean>(DEFAULTS.inlineCompleteEnabled)
@@ -642,14 +839,57 @@ export const useSettingsStore = defineStore('settings', () => {
    */
   let legacyLocalImage: { dataUrl: string; name: string } | null = null
 
-  /** 读取持久化设置；任一字段不合法就单独回退，不整体丢弃 */
-  function load() {
+  /**
+   * 读全局那份存档（`:global`）。
+   *
+   * 缺席时**从按档存档里的旧字段迁移**：老用户的那四个值原本就写在
+   * `:settings` 里（已被 claimLegacy 改名成 `@desktop`）。迁移只在这一处发生，
+   * 之后 persistGlobal 会把它们写进 `:global`，按档那份不再写这些键。
+   *
+   * 不提 SCHEMA_VERSION 做整份丢弃的判据以外的事：这份存档只有四个字段，
+   * 逐字段回落默认已经够。
+   */
+  function loadGlobal(legacy?: Partial<SettingsState>) {
+    let source: Partial<GlobalState> | undefined
     try {
-      const raw = localStorage.getItem(STORAGE_KEY)
-      if (!raw) return
+      const raw = localStorage.getItem(GLOBAL_KEY)
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<GlobalState>
+        if (parsed?.version === SCHEMA_VERSION) source = parsed
+      }
+    } catch {
+      // 非法 JSON：当作没有这份存档，走下面的迁移 / 默认值
+    }
+
+    const from = source ?? legacy
+    if (!from) return
+
+    suggestEnabled.value =
+      typeof from.suggestEnabled === 'boolean' ? from.suggestEnabled : DEFAULTS.suggestEnabled
+    inlineCompleteEnabled.value =
+      typeof from.inlineCompleteEnabled === 'boolean'
+        ? from.inlineCompleteEnabled
+        : DEFAULTS.inlineCompleteEnabled
+    searchHistoryEnabled.value =
+      typeof from.searchHistoryEnabled === 'boolean'
+        ? from.searchHistoryEnabled
+        : DEFAULTS.searchHistoryEnabled
+    customEngines.value = sanitizeEngineList(from.customEngines)
+  }
+
+  /**
+   * 读按档那份存档（`leisure-hub:settings@<active>`）；任一字段不合法就单独回退，不整体丢弃。
+   *
+   * 返回**整份 parsed**，供 loadGlobal 在 `:global` 缺席时当迁移源：老存档里
+   * 那四个搜索字段就写在这一份里。读不到 / 读坏时返回 undefined。
+   */
+  function loadProfile(): Partial<SettingsState> | undefined {
+    try {
+      const raw = localStorage.getItem(settingsKey())
+      if (!raw) return undefined
 
       const parsed = JSON.parse(raw) as Partial<SettingsState>
-      if (parsed?.version !== SCHEMA_VERSION) return
+      if (parsed?.version !== SCHEMA_VERSION) return undefined
 
       bgMode.value = pick(parsed.bgMode, BG_MODES, DEFAULTS.bgMode)
 
@@ -731,38 +971,73 @@ export const useSettingsStore = defineStore('settings', () => {
       // 旧版本存档没有这个字段，undefined 时保持默认的「开启」
       closeOnScrim.value =
         typeof parsed.closeOnScrim === 'boolean' ? parsed.closeOnScrim : DEFAULTS.closeOnScrim
-      areaMode.value = pick(parsed.areaMode, AREA_MODES, DEFAULTS.areaMode)
+      /*
+       * 手柄高度。
+       *
+       * 旧存档里没有它（那时它独占 `starfall-hub:settings-handle`）。
+       * 认领旧键那一步在 load() 里做——这里只管本份存档里有没有，
+       * 而「有没有」正是 load() 判断该不该去认领的依据。
+       */
+      handleRatio.value =
+        typeof parsed.handleRatio === 'number'
+          ? clampHandleRatio(parsed.handleRatio)
+          : DEFAULTS.handleRatio
+      /*
+       * 区域四项的回落值按**当前档的预设**取，不是一套写死的数。
+       *
+       * 手机档缺字段时要落到 cell 3×N，落到电脑档的 pixel 1440×720 会让它那张
+       * 3 列的播种表被 resize 成 15 列——首屏排布完全不是设计好的样子。
+       */
+      const area = areaDefaults()
+      areaMode.value = pick(parsed.areaMode, AREA_MODES, area.areaMode)
       areaWidth.value = clampArea(parsed.areaWidth, AREA_SIZE_MIN, AREA_SIZE_MAX)
       areaHeight.value = clampArea(parsed.areaHeight, AREA_SIZE_MIN, AREA_SIZE_MAX)
       areaCols.value = clampArea(parsed.areaCols, AREA_CELL_MIN, AREA_CELL_MAX)
       areaRows.value = clampArea(parsed.areaRows, AREA_CELL_MIN, AREA_CELL_MAX)
 
       /*
-       * 搜索的四个字段。
+       * 搜索那四个字段不在这里读。
        *
-       * 一律走「undefined 时取默认值」而不是提 SCHEMA_VERSION：版本一变，
-       * 上面那个 `parsed.version !== SCHEMA_VERSION` 会整份丢弃存档，
-       * 用户的背景图、方块区域尺寸、抽屉停靠侧全部清空。
-       * 与 closeOnScrim 当初的加法完全一致。
+       * 它们已经搬去 `:global`（见 loadGlobal）。这里把整份 parsed 交回给调用方，
+       * 让它在 `:global` 缺席时当作迁移源——老存档里那四个键还在。
        */
-      suggestEnabled.value =
-        typeof parsed.suggestEnabled === 'boolean' ? parsed.suggestEnabled : DEFAULTS.suggestEnabled
-      inlineCompleteEnabled.value =
-        typeof parsed.inlineCompleteEnabled === 'boolean'
-          ? parsed.inlineCompleteEnabled
-          : DEFAULTS.inlineCompleteEnabled
-      searchHistoryEnabled.value =
-        typeof parsed.searchHistoryEnabled === 'boolean'
-          ? parsed.searchHistoryEnabled
-          : DEFAULTS.searchHistoryEnabled
-      customEngines.value = Array.isArray(parsed.customEngines)
-        ? parsed.customEngines
-            .map(sanitizeCustomEngine)
-            .filter((engine): engine is CustomEngine => engine !== null)
-            .slice(0, CUSTOM_ENGINE_MAX)
-        : []
+      return parsed
     } catch {
       // 非法 JSON：保持默认设置
+      return undefined
+    }
+  }
+
+  /**
+   * 读盘：按档一份 + 全局一份 + 一次性认领旧手柄键。
+   *
+   * 顺序要紧两处：
+   * - 先读按档那份，它的返回值是 `:global` 缺席时的迁移源；
+   * - 手柄高度**只在按档存档里没有这个字段时**才去认领旧键。反过来（无条件认领）
+   *   会让老用户每次启动都被那个旧值覆盖掉他后来拖到的位置——直到某次启动
+   *   恰好在写盘之后。
+   */
+  function load() {
+    const profile = loadProfile()
+    loadGlobal(profile)
+    if (typeof profile?.handleRatio !== 'number') {
+      const legacy = claimLegacyHandleRatio()
+      if (legacy !== null) handleRatio.value = legacy
+    }
+  }
+
+  function persistGlobal() {
+    const payload: GlobalState = {
+      version: SCHEMA_VERSION,
+      suggestEnabled: suggestEnabled.value,
+      inlineCompleteEnabled: inlineCompleteEnabled.value,
+      searchHistoryEnabled: searchHistoryEnabled.value,
+      customEngines: customEngines.value,
+    }
+    try {
+      localStorage.setItem(GLOBAL_KEY, JSON.stringify(payload))
+    } catch {
+      // 存储不可用（隐私模式 / 配额）时静默降级为内存状态
     }
   }
 
@@ -789,18 +1064,22 @@ export const useSettingsStore = defineStore('settings', () => {
       scrimOpacity: scrimOpacity.value,
       drawerSide: drawerSide.value,
       closeOnScrim: closeOnScrim.value,
+      handleRatio: handleRatio.value,
       areaMode: areaMode.value,
       areaWidth: areaWidth.value,
       areaHeight: areaHeight.value,
       areaCols: areaCols.value,
       areaRows: areaRows.value,
-      suggestEnabled: suggestEnabled.value,
-      inlineCompleteEnabled: inlineCompleteEnabled.value,
-      searchHistoryEnabled: searchHistoryEnabled.value,
-      customEngines: customEngines.value,
+      /*
+       * 搜索那四个字段**不写在这里**（类型上已改为可选，见 SettingsState）。
+       *
+       * 它们归 persistGlobal 写进 `:global`。留在这里会得到两份真相：改一次设置
+       * 写两处、而 loadProfile 又不读它们，于是按档那份从此只增不减地陈旧下去，
+       * 将来谁读到它都会拿到用户几个版本前的选择。
+       */
     }
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
+      localStorage.setItem(settingsKey(), JSON.stringify(payload))
     } catch {
       // 存储不可用（隐私模式 / 配额）时静默降级为内存状态
     }
@@ -1044,10 +1323,15 @@ export const useSettingsStore = defineStore('settings', () => {
     }
     bgLocalImages.value = next
 
-    // 3. 清孤儿
-    for (const id of await listImageIds()) {
-      if (!alive.has(id)) await deleteImage(id)
-    }
+    /*
+     * 3. 清孤儿——alive 集合必须是**所有档**的并集，不是这一档的。
+     *
+     * 曾经就用上面那个 alive（只含当前档），多档之后等于「打开电脑档就删掉手机档
+     * 的全部壁纸字节」，见 referencedImageIds 开头那段。overrides 把当前档换成
+     * 内存里刚整理过的这一份：存档里可能还留着刚被丢掉的死项（字节读不出来的
+     * 那些），照存档算会把它们当成仍被引用，孤儿就永远清不掉。
+     */
+    await pruneOrphanImages(new Map([[activeProfileId(), [...alive]]]))
   }
 
   function setBgMode(next: BgMode) {
@@ -1189,13 +1473,26 @@ export const useSettingsStore = defineStore('settings', () => {
     return rejected
   }
 
-  /** 移除一张本地图：撤销 objectURL、删字节、摘索引 */
+  /**
+   * 移除一张本地图：撤销 objectURL、摘索引，**没有别的档引用时**才删字节。
+   *
+   * 「复制当前配置」会让两档指着同一个 id（IDB 里那份字节是全局共享的，抄存档时
+   * 刻意不抄字节）。无条件 deleteImage 等于「从副本里删掉一张壁纸，原档的那张
+   * 也一起没了」——8MB 的照片，不可逆。
+   *
+   * overrides 传**删除之后**的本档 id 列表：此刻内存已经改完但还没落盘（persist
+   * 走 watch，在下一个 tick），照存档快照算会把正要删的 id 算成仍被引用。
+   */
   async function removeBgLocalImage(id: string) {
     const target = bgLocalImages.value.find((item) => item.id === id)
     // 撤销才会真正释放那份 Blob，否则它一直挂在文档上直到关标签页
     if (target?.url) URL.revokeObjectURL(target.url)
     bgLocalImages.value = bgLocalImages.value.filter((item) => item.id !== id)
-    await deleteImage(id)
+
+    const mine = bgLocalImages.value.map((item) => item.id)
+    if (!referencedImageIds(new Map([[activeProfileId(), mine]])).has(id)) {
+      await deleteImage(id)
+    }
   }
 
   /* ── 网络图片档 ───────────────────────────── */
@@ -1319,12 +1616,24 @@ export const useSettingsStore = defineStore('settings', () => {
     drawerSide.value = pick(next, DRAWER_SIDES, DEFAULTS.drawerSide)
   }
 
+  /**
+   * 设手柄纵向位置，0..1。
+   *
+   * 与 setDrawerSide 成对：拖动手柄时两者一起改（见 useEdgeHandle 的 follow）。
+   * 夹取在这里做而不是让调用方自己夹——拖拽是逐帧回调，指针拖出视口时
+   * clientY / height 会越界，越界值落进 ref 会让手柄贴到屏幕角落之外。
+   */
+  function setHandleRatio(next: number) {
+    handleRatio.value = clampHandleRatio(next)
+  }
+
   function setCloseOnScrim(next: boolean) {
     closeOnScrim.value = next
   }
 
   function setAreaMode(next: AreaMode) {
-    areaMode.value = pick(next, AREA_MODES, DEFAULTS.areaMode)
+    // 非法值回落到本档预设的档位，理由同 areaDefaults：不存在一套跨档通用的默认
+    areaMode.value = pick(next, AREA_MODES, areaDefaults().areaMode)
   }
 
   function setAreaWidth(next: number) {
@@ -1430,16 +1739,30 @@ export const useSettingsStore = defineStore('settings', () => {
    * 一律逐字段写回 DEFAULTS 而不是「重建 store」：那些 watch（persist、
    * data-motion / data-glass、两个 CSS 变量）都挂在现有的 ref 上，
    * 换掉引用等于让它们全部失联。
+   *
+   * **作用域是当前配置档**：区域尺寸与手柄高度回到**这一档预设**的值（见
+   * areaDefaults），不是一套写死的数——手机档重置后该是 cell 3×N，落到电脑档的
+   * pixel 1440×720 会把它那张 3 列的布局 resize 成 15 列。全局那四个搜索字段
+   * 仍一并重置：它们只有一份，「重置设置」不该留着上次的自定义引擎表。
    */
   function reset() {
     bgMode.value = DEFAULTS.bgMode
     bgColors.value = [...DEFAULTS.bgColors]
-    // 图片字节一并清掉：留着就是永久孤儿，没有任何入口能再删
+    /*
+     * 图片字节一并清掉：留着就是永久孤儿，没有任何入口能再删。
+     *
+     * 但**只删没有别的档引用的**——理由同 removeBgLocalImage。overrides 传空数组：
+     * 重置后本档一张不留，此刻存档里那份旧快照还在（persist 走 watch，下个 tick 才写）。
+     */
+    const doomed = bgLocalImages.value.map((item) => item.id)
     for (const item of bgLocalImages.value) {
       if (item.url) URL.revokeObjectURL(item.url)
-      void deleteImage(item.id)
     }
     bgLocalImages.value = []
+    const aliveElsewhere = referencedImageIds(new Map([[activeProfileId(), []]]))
+    for (const id of doomed) {
+      if (!aliveElsewhere.has(id)) void deleteImage(id)
+    }
     /*
      * 网络地址回到那张默认壁纸，不是清空。
      *
@@ -1465,11 +1788,18 @@ export const useSettingsStore = defineStore('settings', () => {
     scrimOpacity.value = DEFAULTS.scrimOpacity
     drawerSide.value = DEFAULTS.drawerSide
     closeOnScrim.value = DEFAULTS.closeOnScrim
-    areaMode.value = DEFAULTS.areaMode
-    areaWidth.value = DEFAULTS.areaWidth
-    areaHeight.value = DEFAULTS.areaHeight
-    areaCols.value = DEFAULTS.areaCols
-    areaRows.value = DEFAULTS.areaRows
+    handleRatio.value = DEFAULTS.handleRatio
+    /*
+     * 区域四项回**本档预设**，不是 DEFAULTS 里的四个数——DEFAULTS 已经没有它们了
+     * （见 areaDefaults 那段）。这也是「重置」与网格 reset 必须互解的那一环：
+     * grid.reset() 按同一个预设摆 15×6 / 3×N，两边取自同一张表。
+     */
+    const area = areaDefaults()
+    areaMode.value = area.areaMode
+    areaWidth.value = area.areaWidth
+    areaHeight.value = area.areaHeight
+    areaCols.value = area.areaCols
+    areaRows.value = area.areaRows
     suggestEnabled.value = DEFAULTS.suggestEnabled
     inlineCompleteEnabled.value = DEFAULTS.inlineCompleteEnabled
     searchHistoryEnabled.value = DEFAULTS.searchHistoryEnabled
@@ -1517,6 +1847,15 @@ export const useSettingsStore = defineStore('settings', () => {
       scrimOpacity,
       drawerSide,
       closeOnScrim,
+      /*
+       * 手柄纵向位置也在这里。
+       *
+       * 它原先有自己的一份存档与一次手动 persistRatio（在 pointerup 里调），
+       * 并进按档 settings 之后那次手动调用就多余了——但**必须记得加进这个依赖数组**，
+       * 否则表现为「拖了手柄、刷新后回到原处」，而且看不出是哪里漏的：
+       * 拖拽本身、夹取、UI 全都正常，只有落盘这一步静默失败。
+       */
+      handleRatio,
       areaMode,
       areaWidth,
       areaHeight,
@@ -1534,7 +1873,20 @@ export const useSettingsStore = defineStore('settings', () => {
        */
       customEngines,
     ],
-    persist,
+    /*
+     * 一次改动落两份盘。
+     *
+     * 依赖数组里既有按档字段（背景、区域、抽屉……）也有全局字段（后四个搜索项），
+     * 两份存档各自只取自己那一半（见 persist / persistGlobal 的 payload），
+     * 所以无脑两个都写是安全的，代价是每次改动多一次 JSON.stringify 与一次 setItem。
+     *
+     * 刻意不拆成两个 watch 各盯自己的依赖：那样「哪个字段属于哪份存档」就有了
+     * 第二处真相，加字段时漏改一边只会表现为「这个设置不保存」——比多写一次盘难查得多。
+     */
+    () => {
+      persist()
+      persistGlobal()
+    },
   )
 
   // 动效开关落到 <html> 的属性上：CSS 侧一处兜底关掉全部 transition / animation
@@ -1602,6 +1954,8 @@ export const useSettingsStore = defineStore('settings', () => {
     scrimOpacity,
     drawerSide,
     closeOnScrim,
+    /** 手柄纵向位置：唯一的真相在这里，useEdgeHandle 只是转发（见那边的文件头注释） */
+    handleRatio,
     areaMode,
     areaWidth,
     areaHeight,
@@ -1647,6 +2001,7 @@ export const useSettingsStore = defineStore('settings', () => {
     setThemeColor,
     setScrimOpacity,
     setDrawerSide,
+    setHandleRatio,
     setCloseOnScrim,
     setAreaMode,
     setAreaWidth,

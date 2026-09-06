@@ -1,6 +1,7 @@
 import type { WeatherPlace, WeatherView } from './types'
+import { ensureStorageMigrated, STORAGE_NAMESPACE } from '@/utils/storageNamespace'
 
-const STORAGE_PREFIX = 'starfall-hub:weather:'
+const STORAGE_PREFIX = `${STORAGE_NAMESPACE}:weather:`
 
 /**
  * 新鲜期 15 分钟。
@@ -40,6 +41,7 @@ export function placeKey(place: WeatherPlace): string {
  * 一条坏数据不该让方块永久停在失败态。
  */
 export function readCache(key: string): WeatherView | undefined {
+  ensureStorageMigrated()
   try {
     const raw = localStorage.getItem(STORAGE_PREFIX + key)
     if (!raw) return undefined
@@ -80,6 +82,7 @@ export function readCache(key: string): WeatherView | undefined {
  * 抛出去只会让一次成功的取数看起来像失败了。
  */
 export function writeCache(key: string, view: WeatherView): void {
+  ensureStorageMigrated()
   try {
     localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(view))
   } catch {
@@ -102,6 +105,7 @@ export function isStale(view: WeatherView, now = Date.now()): boolean {
  * 先收集再删：直接在遍历里 removeItem 会让后续下标整体前移，漏掉相邻的键。
  */
 export function clearWeatherCache(): void {
+  ensureStorageMigrated()
   try {
     const keys: string[] = []
     for (let i = 0; i < localStorage.length; i++) {

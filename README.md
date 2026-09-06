@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="starfall-hub/public/favicon.svg" alt="StarFallHub" width="112" height="112" />
+<img src="leisure-hub/public/favicon.svg" alt="Leisure Hub" width="112" height="112" />
 
-# StarFallHub
+# Leisure Hub
 
 **一整屏方格墙，把常用网站、日历、天气和搜索全摆在你打开浏览器的第一眼。**
 
@@ -27,7 +27,7 @@
 - 想知道今天几号、出门要不要带伞，得分别去开日历和天气网站；
 - 想把主页打扮成自己的样子，要么装个笨重的扩展，要么注册个云同步账号。
 
-StarFallHub 就是一张铺满整个屏幕的方格墙：空格子点一下就能加网站，格子之间按住拖动就能换位；也可以往格子里放日历、天气、搜索这样的小组件。它不注册账号、不连服务器，所有数据都保存在你浏览器的本地存储里。
+Leisure Hub 就是一张铺满整个屏幕的方格墙：空格子点一下就能加网站，格子之间按住拖动就能换位；也可以往格子里放日历、天气、搜索这样的小组件。它不注册账号、不连服务器，所有数据都保存在你浏览器的本地存储里。
 
 > 简单说：**它是你的浏览器主页，不是又一个书签管理器。**
 
@@ -75,6 +75,7 @@ StarFallHub 就是一张铺满整个屏幕的方格墙：空格子点一下就�
 - 搜索记录只留在本地，随时可关、可清，不发给任何人。
 - 天气请求发往 Open-Meteo 的公开接口，不带任何身份信息。
 - 网址和背景图都只接受 http(s) 地址，`javascript:` 等协议一律拒收。
+- 从旧版升级时，首次打开会把 `starfall-hub:*` 本地存储键迁移到 `leisure-hub:*`；迁移失败会保留旧键，方便回退。
 
 ## 一些贴心的小设计
 
@@ -92,10 +93,10 @@ StarFallHub 就是一张铺满整个屏幕的方格墙：空格子点一下就�
 
 ## 给开发者
 
-项目主体在 [starfall-hub](starfall-hub)：前端是 Vue 3 `<script setup>` + TypeScript，构建用 Vite，状态管理 Pinia，无 UI 组件库，样式全部是原生 CSS 变量；网格与设置的持久化各自封装了单一读写入口，带 schema 版本校验。规划与设计文档在 [plan](plan) 目录（不进版本库）。
+项目主体在 [leisure-hub](leisure-hub)：前端是 Vue 3 `<script setup>` + TypeScript，构建用 Vite，状态管理 Pinia，无 UI 组件库，样式全部是原生 CSS 变量；网格与设置的持久化各自封装了单一读写入口，带 schema 版本校验。规划与设计文档在 [plan](plan) 目录（不进版本库）。
 
 ```powershell
-cd starfall-hub
+cd leisure-hub
 npm install
 npm run dev       # 本地开发服务器
 npm run build     # 类型检查 + 产出 dist/

@@ -9,7 +9,6 @@ import NumberField from './NumberField.vue'
 import SegmentedControl from './SegmentedControl.vue'
 import ToggleSwitch from './ToggleSwitch.vue'
 import { autoFit } from '@/composables/useAreaViewport'
-import { resetEdgeHandle } from '@/composables/useEdgeHandle'
 import { resetSearchHistory, useSearchHistory } from '@/composables/useSearchHistory'
 import { resetTodos } from '@/composables/useTodos'
 import { clearWeatherCache } from '../widgets/weather/cache'
@@ -29,6 +28,7 @@ import {
   SCRIM_OPACITY_MAX,
   SCRIM_OPACITY_MIN,
   THEME_PRESETS,
+  pruneImagesAfterProfileRemoval,
   useSettingsStore,
   type AreaMode,
   type BgMode,
@@ -36,7 +36,22 @@ import {
   type GlassMode,
   type MotionMode,
 } from '@/stores/settings'
+import {
+  PRESET_LABEL,
+  PRESET_ORDER,
+  PROFILE_NAME_MAX,
+  type ProfileEntry,
+} from '@/types/profile'
 import { normalizeHex } from '@/utils/color'
+import {
+  activeProfileId,
+  createProfile,
+  duplicateActiveProfile,
+  listProfiles,
+  removeProfile,
+  renameProfile,
+  setActiveProfile,
+} from '@/utils/profileKey'
 
 const emit = defineEmits<{ close: [] }>()
 
@@ -59,6 +74,119 @@ const grid = useGridStore()
 const history = useSearchHistory()
 /** 停靠侧由设置驱动，抽屉出场方向与手柄同侧 */
 const side = computed(() => settings.drawerSide)
+
+/* ── 配置档 ─────────────────────────────────── */
+
+/**
+ * 档位列表。
+ *
+ * 存进本地 ref 而不是在模板里直接调 listProfiles()：那个函数每次返回一份新数组
+ * （刻意的，见它的注释「调用方不得原地改它」），模板里现调会让每次重渲染都拿到
+ * 新引用，v-for 整段重建——正在打字的重命名输入框会失焦。
+ *
+ * 索引本身不是响应式的（它是 utils 层的模块级单例，见 profileKey 的文件头），
+ * 所以每个写操作之后手动 refresh 一次。写入口只有下面这几个函数，不会漏。
+ */
+const profiles = ref<ProfileEntry[]>([])
+
+/**
+ * 当前档 id，整页生命周期内恒定。
+ *
+ * 不必是响应式的：切档 = 写索引 + 整页 reload（见 pickProfile），
+ * 这个值在一次页面生命里根本不会变。
+ */
+const currentProfileId = activeProfileId()
+
+/** 每行重命名输入框的本地草稿，键是档位 id */
+const nameDrafts = ref<Record<string, string>>({})
+
+function refreshProfiles() {
+  profiles.value = listProfiles()
+  const next: Record<string, string> = {}
+  for (const item of profiles.value) next[item.id] = item.name
+  nameDrafts.value = next
+}
+refreshProfiles()
+
+/**
+ * 切档 = 写索引 + 整页 reload。
+ *
+ * 不做热切换，理由见 profileKey 的 setActiveProfile 与 plan/10 §4：三个 store 的
+ * load / reset 都不是为「中途换一份存档」写的，热切换要在它们内部各开一条分支。
+ * reload 是同一件事的一行版本，代价是一次白屏——而这个操作用户一天点不了两次。
+ *
+ * setActiveProfile 返回 false 有两种情况（id 不存在、点的就是当前档），
+ * 两种都不该 reload：后者尤其要挡住，否则点一下当前档整页重载，看起来像卡了一下。
+ */
+function pickProfile(id: string) {
+  if (setActiveProfile(id)) location.reload()
+}
+
+/**
+ * 重命名：失焦或回车写入。
+ *
+ * 写完之后一律 refreshProfiles() 把草稿拉回索引里的值，而不是留着用户输入的原文——
+ * renameProfile 会 trim、截到 PROFILE_NAME_MAX、空字符串回落成预设名。
+ * 不同步回来的话，输入框里留着 20 个字，存下的是 16 个，下次失焦又写一遍。
+ */
+function commitProfileName(id: string) {
+  renameProfile(id, nameDrafts.value[id] ?? '')
+  refreshProfiles()
+}
+
+/** 从某个预设新建一档，建完不切过去：切档要 reload，会打断用户接下来的改名 */
+function addProfile(preset: (typeof PRESET_ORDER)[number]) {
+  createProfile(preset)
+  refreshProfiles()
+}
+
+/** 复制当前档：两份按档存档整体抄一份，壁纸字节共享（见 duplicateActiveProfile） */
+function copyProfile() {
+  duplicateActiveProfile()
+  refreshProfiles()
+}
+
+/**
+ * 能不能删。
+ *
+ * 两条拒绝在 removeProfile 里也各拦一道，这里是 UI 侧的那一半：按钮禁掉 + title
+ * 说明原因，不做成「点了没反应」。纪律来自 removeBgColor（settings.ts 那段注释）。
+ */
+function canRemoveProfile(id: string): boolean {
+  return id !== currentProfileId && profiles.value.length > 1
+}
+
+function removeProfileTitle(id: string): string {
+  if (id === currentProfileId) return '不能删除正在使用的配置，先切到别的配置'
+  if (profiles.value.length <= 1) return '至少要保留一个配置'
+  return '删除这个配置'
+}
+
+/** 待确认删除的档位 id；null 表示没有待确认的删除 */
+const confirmRemoveId = ref<string | null>(null)
+
+const confirmRemoveName = computed(
+  () => profiles.value.find((item) => item.id === confirmRemoveId.value)?.name ?? '',
+)
+
+/**
+ * 删档。
+ *
+ * 删完必须跑一次 pruneImagesAfterProfileRemoval：那一档的 `:settings@<id>` 已经
+ * 没了，它**独占**的本地壁纸字节从此没有任何档引用得到，留在 IndexedDB 里就是
+ * 谁也看不见、谁也删不掉的几 MB。被别的档共同引用的那些不会被碰（引用计数，见
+ * stores/settings 的 referencedImageIds）——「复制当前配置」产出的正是这种状态。
+ *
+ * 不 await：它只清字节，界面上没有任何东西等着它。失败也无所谓，下次启动的
+ * hydrate 会再清一遍（同一个 pruneOrphanImages）。
+ */
+function doRemoveProfile() {
+  const id = confirmRemoveId.value
+  confirmRemoveId.value = null
+  if (!id || !removeProfile(id)) return
+  refreshProfiles()
+  void pruneImagesAfterProfileRemoval()
+}
 
 const BG_MODE_OPTIONS: { value: BgMode; label: string }[] = [
   { value: 'color', label: '纯色' },
@@ -518,21 +646,32 @@ const confirmResetOpen = ref(false)
 /**
  * 重置。
  *
- * 六处存档一次写全，顺序无关（彼此不读对方的状态），但**一处都不能少**——
+ * 五处存档一次写全，顺序无关（彼此不读对方的状态），但**一处都不能少**——
  * 用户按下这个按钮期待的是「回到刚装好的样子」，剩下任何一项都会表现为
  * 「重置了但那个还在」：
  *
- *   starfall-hub:grid            布局      → grid.reset()
- *   starfall-hub:settings        设置      → settings.reset()
- *   starfall-hub:todos           待办      → resetTodos()
- *   starfall-hub:search-history  搜索记录  → resetSearchHistory()
- *   starfall-hub:settings-handle 手柄高度  → resetEdgeHandle()（停靠侧归 settings）
- *   starfall-hub:weather:*       天气缓存  → clearWeatherCache()
+ *   leisure-hub:grid@<当前档>      布局      → grid.reset()
+ *   leisure-hub:settings@<当前档>  外观设置  → settings.reset()
+ *   leisure-hub:global            隐私开关与自定义引擎 → settings.reset()（同一个函数）
+ *   leisure-hub:todos             待办      → resetTodos()
+ *   leisure-hub:search-history    搜索记录  → resetSearchHistory()
+ *   leisure-hub:weather:*         天气缓存  → clearWeatherCache()
  *
- * 布局排在设置之前是刻意的：settings.reset() 会把区域尺寸写回 1440×720，
+ * 手柄高度不再单列一条：它已并入按档的 `:settings@<id>`，由 settings.reset()
+ * 一并回正中（原先那份 `:settings-handle` 与 resetEdgeHandle 都已删除）。
+ *
+ * **作用域跨档，这是多配置档之后最容易漏的一点。** 动的是**当前这个配置**的布局与
+ * 外观，加上**所有配置共用**的待办、搜索记录、隐私开关与引擎表——后四样是全局存档
+ * （理由见 stores/settings 的 `:global` 那段与 useTodos 的文件头），从手机档按下
+ * 重置，电脑档的待办也一起回到初始状态。别的档的布局与外观、以及索引本身
+ * （档位列表与 active）一律不动。上面那段 hint 与 ConfirmDialog 的正文都写明了这条，
+ * 不写就是一次静默的跨档数据删除。
+ *
+ * 布局排在设置之前是刻意的：settings.reset() 会把区域尺寸写回**本档预设**的四项，
  * TileGrid 那个 watch 随即按新尺寸 resize 网格。让 grid.reset() 先落位，
- * resize 拿到的就是默认布局本身（15×6 与 1440×720 互解，见 tile.ts），
- * 是一次空操作；反过来则是先按旧尺寸摆好默认布局、再被 resize 挪一遍。
+ * resize 拿到的就是默认布局本身（每档各自互解：电脑档 15×6 ↔ 1440×720，
+ * 手机档 3×N ↔ cell 3×N，见 types/profile 的 PROFILE_PRESETS），是一次空操作；
+ * 反过来则是先按旧尺寸摆好默认布局、再被 resize 挪一遍。
  *
  * 抽屉不关：重置后主题色、背景、遮罩深浅全变了，抽屉本身就是这些变化最直接的
  * 取景框，关掉反而让人不确定到底生效了没有。
@@ -543,7 +682,6 @@ function doReset() {
   settings.reset()
   resetTodos()
   resetSearchHistory()
-  resetEdgeHandle()
   clearWeatherCache()
   /*
    * 地址行的本地草稿要跟着换。
@@ -664,6 +802,113 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
         </header>
 
         <div class="drawer__body">
+          <!--
+            ── 配置档 ─────────────────────────────
+
+            排在最前面，与钉在最底下的「重置」正好相反：重置是一个**作用于**全部
+            设置项的动作，配置档是这些设置项的**作用域**。作用域在前、动作在后——
+            放到底下的后果是用户改完二十项才发现自己改的是另一个档。
+
+            四个操作全部沿用抽屉里已有的形状，一个新组件都不做：切换是网络地址那行
+            的 `.url-row__pick`（同一颗勾、同一套禁用即选中的语义），重命名是行内
+            输入框，删除是 `__del` + 已在场的 ConfirmDialog，新增是 `.actions` 里的
+            ghost 按钮。刻意**不用 SegmentedControl**——那是给 2–3 个固定选项的
+            （三个背景档、三个动画档），而配置档数量不定、还能改名，竖排行列表同时
+            解决了「名字多长都放得下」。
+          -->
+          <section class="group">
+            <h3 class="group__title">配置档</h3>
+
+            <div class="url-list">
+              <div v-for="item in profiles" :key="item.id" class="url-row">
+                <input
+                  :id="`profile-name-${item.id}`"
+                  v-model="nameDrafts[item.id]"
+                  class="field__input url-row__input"
+                  type="text"
+                  :maxlength="PROFILE_NAME_MAX"
+                  :aria-label="`配置名称：${item.name}`"
+                  @change="commitProfileName(item.id)"
+                  @keydown.enter.prevent="commitProfileName(item.id)"
+                />
+                <!--
+                  切换：与地址行那颗勾同款，已选中的那个禁用——它本身就是
+                  「正在用这个」的标记，留着可点只会让人怀疑没生效。
+                  title 里写明会重新载入页面：这是抽屉里唯一一个有这种副作用的按钮。
+                -->
+                <button
+                  class="url-row__pick"
+                  type="button"
+                  :disabled="item.id === currentProfileId"
+                  :aria-pressed="item.id === currentProfileId"
+                  :title="
+                    item.id === currentProfileId ? '正在使用这个配置' : '切过去（会重新载入页面）'
+                  "
+                  :aria-label="
+                    item.id === currentProfileId
+                      ? `${item.name} 正在使用中`
+                      : `切换到 ${item.name}，页面会重新载入`
+                  "
+                  @click="pickProfile(item.id)"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2.4"
+                      d="m5 13 4 4L19 7"
+                    />
+                  </svg>
+                </button>
+                <!-- 两条拒绝（当前档、只剩一档）都禁用 + title 说明，不做成点了没反应 -->
+                <button
+                  class="url-row__del"
+                  type="button"
+                  :disabled="!canRemoveProfile(item.id)"
+                  :title="removeProfileTitle(item.id)"
+                  :aria-label="`删除配置 ${item.name}`"
+                  @click="confirmRemoveId = item.id"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-width="2"
+                      d="M6 6l12 12M18 6L6 18"
+                    />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <!--
+              三个按钮而不是一个：一个按钮就得再问一次「基于什么」，那要么开一个新
+              对话框、要么在行内塞一个下拉。前两个按 PRESET_ORDER 铺开，加第三个
+              预设时这里不必改。「复制当前配置」是其中最有用的一个——想要「电脑档，
+              但换一张壁纸」时不必从头摆一遍布局。
+            -->
+            <div class="actions actions--wrap">
+              <button
+                v-for="preset in PRESET_ORDER"
+                :key="preset"
+                class="btn btn--ghost"
+                type="button"
+                @click="addProfile(preset)"
+              >
+                从{{ PRESET_LABEL[preset] }}预设新建
+              </button>
+              <button class="btn btn--ghost" type="button" @click="copyProfile">
+                复制当前配置
+              </button>
+            </div>
+
+            <p class="group__hint">
+              每个配置各有一套方块布局与外观设置；待办、搜索记录与搜索的三个开关由
+              所有配置共用。新建的配置不会自动切过去，切换配置会重新载入页面。
+            </p>
+          </section>
+
           <!-- ── 背景 ─────────────────────────────── -->
           <section class="group">
             <h3 class="group__title">背景</h3>
@@ -1411,9 +1656,21 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           -->
           <section class="group group--last">
             <h3 class="group__title">重置</h3>
+            <!--
+              hint 必须写明作用域，这是多档之后最要紧的一句。
+
+              「把布局、设置与待办恢复成初始状态」字面上仍然对，却漏了一件事：
+              待办、搜索记录与搜索的三个开关是**全局**存档，从手机档按下这个按钮，
+              电脑档的待办也一起没了。不写出来，它就是一次静默的跨档数据删除。
+
+              两句拆开写、按「只动这一档」→「跨全部档」→「不动别的档」排：
+              抽屉里所有 hint 都是纯文本，不用 strong 之类的行内标记加重
+              （视觉语言里没有那一档，也没有对应样式），靠句子顺序表达轻重。
+            -->
             <p class="group__hint">
-              把布局、设置与待办一并恢复成初始状态：默认的方块摆放、壁纸与主题色、
-              以及那条示例待办。搜索记录与天气缓存会被清空。
+              当前配置的方块摆放与外观设置回到初始状态：默认布局、壁纸与主题色。
+              所有配置共用的待办、搜索记录与搜索的三个开关也一并回到初始状态，天气缓存清空。
+              其它配置的布局与外观不受影响。
             </p>
             <div class="actions">
               <button class="btn btn--danger" type="button" @click="confirmResetOpen = true">
@@ -1463,17 +1720,39 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
         与两台取色面板同样挂在 .scrim 内部（并列的第二个根节点会让外层过渡失效），
         自己再 Teleport 到 body。它的 z-index 也是 --z-menu，压在抽屉之上。
 
-        文案把三样东西逐个点名：只说「恢复默认设置」会让人以为方块摆放不受影响，
-        而这正是这次重置里最不可逆的一样。
+        文案把作用域与后果都点名：只说「恢复默认设置」会让人以为方块摆放不受影响
+        （那是这次重置里最不可逆的一样），而多档之后还要说清「这一档」与「全部档」
+        的分界——待办与搜索记录是全局的，从任一档重置都会一起清掉。
       -->
       <OverlayLayer name="confirm">
         <ConfirmDialog
           v-if="confirmResetOpen"
           title="重置为默认？"
-          message="当前的方块摆放、全部设置与待办清单都会被丢弃，换回初始状态；搜索记录与天气缓存一并清空。已添加的本地壁纸会被删除，此操作无法撤销。"
+          message="当前配置的方块摆放与外观设置会被丢弃，换回初始状态；所有配置共用的待办、搜索记录与搜索开关也一并回到初始状态，天气缓存清空。此配置里添加的本地壁纸会被删除，此操作无法撤销。其它配置不受影响。"
           confirm-label="重置"
           @confirm="doReset"
           @cancel="confirmResetOpen = false"
+        />
+      </OverlayLayer>
+
+      <!--
+        删档的二次确认。
+
+        与重置那台是两个独立实例而不是一台切换用途，与两台取色面板同一个判据：
+        v-if 条件、文案、回调各不相同，共用一台就得在每个回调里分辨「这次是重置
+        还是删档」。同一时刻只可能开一台，多一个节点不占什么。
+
+        删档删的是那一档的布局、外观与它独占的本地壁纸字节，撤不回来
+        （壁纸字节已从 IndexedDB 删掉），所以走「先问再做」而不是可撤销。
+      -->
+      <OverlayLayer name="confirm">
+        <ConfirmDialog
+          v-if="confirmRemoveId"
+          title="删除这个配置？"
+          :message="`「${confirmRemoveName}」的方块布局与外观设置会被删除，只被它用到的本地壁纸也会一并删掉，无法撤销。待办与搜索记录是所有配置共用的，不受影响。`"
+          confirm-label="删除"
+          @confirm="doRemoveProfile"
+          @cancel="confirmRemoveId = null"
         />
       </OverlayLayer>
     </div>
@@ -2030,9 +2309,15 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   outline-offset: 2px;
 }
 
-/* ── 网络地址列表 ─────────────────────────────────── */
+/* ── 行列表（网络地址 / 配置档共用） ─────────────── */
 
 /*
+ * 这一套 .url-list / .url-row / __input / __pick / __del 有两个消费方：
+ * 网络图片的地址列表与最上面那节配置档。类名沿用 url- 前缀而不是另起一套
+ * 中性名（list-row 之类）——两处的形状完全一致（一行输入框 + 行尾一颗勾一个叉），
+ * 改名要动的是两处模板与十几条选择器，换来的只是名字更准。
+ * 配置档那节不用 .url-add（新增走下面的 ghost 按钮），所以 --url-tail-w 与它无关。
+ *
  * 行高固定成一个变量，下面的滚动上限直接乘它。
  *
  * 曾经按 .field__input 的 padding + 字号「推算」出 34px，实测行高却是 37px
@@ -2114,9 +2399,21 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   height: 14px;
 }
 
-.url-row__del:hover {
+.url-row__del:hover:not(:disabled) {
   background: var(--fill-hover);
   color: var(--danger);
+}
+
+/*
+ * 删除禁用态压暗，与「勾」的禁用态相反。
+ *
+ * 那颗勾禁用时保持 opacity: 1 且染 --accent，因为它表达的是「已选中」；
+ * 这里的禁用是真的不可用（不能删当前档 / 不能删到零档），压暗才对得上。
+ * 原因写在按钮的 title 里，不做成点了没反应。
+ */
+.url-row__del:disabled {
+  color: var(--color-text-disabled);
+  cursor: default;
 }
 
 /*
@@ -2258,6 +2555,22 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 .actions {
   display: flex;
   gap: var(--sp-2);
+}
+
+/*
+ * 配置档那排三个 ghost 按钮要换行。
+ *
+ * .actions 默认单行不换（那里最多两个按钮：一个主 + 一个「自动」），
+ * 三个「从…新建 / 复制当前配置」在 380px 宽的抽屉里横排必然挤成竖条文字。
+ * flex: 1 1 auto 让它们按文字长度分配、放不下就折行，而 .btn--ghost 自己是
+ * flex: none——所以这里要把它盖回来。
+ */
+.actions--wrap {
+  flex-wrap: wrap;
+}
+
+.actions--wrap .btn {
+  flex: 1 1 auto;
 }
 
 .btn {

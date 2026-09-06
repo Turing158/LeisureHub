@@ -9,8 +9,11 @@ import {
 } from '@/types/todo'
 import { buildDefaultTodos } from '@/data/defaults'
 import { nanoid } from 'nanoid'
+import { ensureStorageMigrated, namespacedStorageKey } from '@/utils/storageNamespace'
 
-const STORAGE_KEY = 'starfall-hub:todos'
+ensureStorageMigrated()
+
+const STORAGE_KEY = namespacedStorageKey('todos')
 
 /**
  * 待办清单。

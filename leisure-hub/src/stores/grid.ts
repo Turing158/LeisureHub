@@ -3,9 +3,9 @@ import { nanoid } from 'nanoid'
 import { computed, ref, watch } from 'vue'
 
 import {
-  DEFAULT_GRID_COLS,
-  DEFAULT_GRID_ROWS,
   GRID_SCHEMA_VERSION,
+  defaultGridCols,
+  defaultGridRows,
   setGridCols,
   tileSpan,
   type GridState,
@@ -14,9 +14,18 @@ import {
 } from '@/types/tile'
 import { buildDefaultGrid } from '@/data/defaults'
 import { isHexColor } from '@/utils/color'
+import { activeProfilePreset, keyFor } from '@/utils/profileKey'
 import { sanitizeWidgetProps } from '@/types/widgetProps'
 
-const STORAGE_KEY = 'starfall-hub:grid'
+/**
+ * 存档键按档带后缀（`leisure-hub:grid@<id>`）。
+ *
+ * 现取而不是模块级常量：模块求值可能早于配置档索引被读，那一刻拼出来的键会
+ * 指向错误的档。keyFor 内部保证索引已就绪，代价是一次字符串拼接。
+ */
+function storageKey(): string {
+  return keyFor('grid')
+}
 
 function emptySlots(count: number): (Tile | null)[] {
   return Array.from({ length: count }, () => null)
@@ -195,9 +204,9 @@ function sanitizeTile(value: unknown, keepSpan = false): Tile | null {
 }
 
 export const useGridStore = defineStore('grid', () => {
-  const cols = ref(DEFAULT_GRID_COLS)
-  const rows = ref(DEFAULT_GRID_ROWS)
-  const slots = ref<(Tile | null)[]>(emptySlots(DEFAULT_GRID_COLS * DEFAULT_GRID_ROWS))
+  const cols = ref(defaultGridCols())
+  const rows = ref(defaultGridRows())
+  const slots = ref<(Tile | null)[]>(emptySlots(cols.value * rows.value))
   /**
    * 网格缩小时挤出来的方块。
    * 暂存而不丢弃，窗口重新变大后 resize 会按顺序放回空位。
@@ -210,11 +219,14 @@ export const useGridStore = defineStore('grid', () => {
    * 首次打开与「重置为默认」共用这一处，也是**读盘失败时的落点**——空网格曾经是
    * 那个落点，但「默认」现在有了内容，两条路各给一种结果就等于同一个概念有两个答案。
    *
+   * 布局按**当前配置档自己的预设**取：手机档回到 3 列的那张表，不是回到电脑档
+   * （这正是索引里持久化 preset 的原因，见 types/profile 的 ProfileEntry）。
+   *
    * 先 setGridCols 再赋值，与 load / resize 同一条顺序纪律：所有 tileSpan 读取
    * （搜索方块的宽度上限跟随列数）都必须看到新的列数。
    */
   function seedDefaults() {
-    const seed = buildDefaultGrid()
+    const seed = buildDefaultGrid(activeProfilePreset())
     setGridCols(seed.cols)
     cols.value = seed.cols
     rows.value = seed.rows
@@ -230,7 +242,7 @@ export const useGridStore = defineStore('grid', () => {
    */
   function load() {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY)
+      const raw = localStorage.getItem(storageKey())
       if (!raw) return seedDefaults()
 
       const parsed = JSON.parse(raw) as GridState
@@ -263,7 +275,7 @@ export const useGridStore = defineStore('grid', () => {
       overflow: overflow.value,
     }
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
+      localStorage.setItem(storageKey(), JSON.stringify(payload))
     } catch {
       // 存储不可用（隐私模式 / 配额）时静默降级为内存状态
     }

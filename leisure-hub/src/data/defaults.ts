@@ -1,6 +1,7 @@
 import { nanoid } from 'nanoid'
 
-import { DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, type Tile, type TileDraft } from '@/types/tile'
+import { PROFILE_PRESETS, type ProfilePreset } from '@/types/profile'
+import { type Tile, type TileDraft } from '@/types/tile'
 import type { TodoItem } from '@/types/todo'
 
 /*
@@ -13,6 +14,11 @@ import type { TodoItem } from '@/types/todo'
  *
  * 一律做成 build 函数而不是导出常量：调用方拿到的必须是能直接改写的新数组，
  * 否则 store 一次原地改写就把「默认值」本身改掉了，重置后拿到的是上次被改过的状态。
+ *
+ * **每个配置档预设各有一张播种表**，不共用一张再重排：电脑档的锚点按 15 列折算，
+ * resize 到 3 列时宽 4 的日历、宽 7 的搜索在 `areaFree` 里 `col + w > cols` 恒为 false，
+ * 落进 displaced，内层补位循环的 `col + w <= nextCols` 也永不成立——三个组件全部进
+ * overflow 暂存，手机档首次打开会是一片空网格。
  */
 
 /** 一个方块的播种位置：锚点槽位下标 + 内容（id 由 build 时补） */
@@ -22,9 +28,9 @@ interface GridSeed {
 }
 
 /**
- * 默认桌面。
+ * 默认桌面（电脑档）。
  *
- * 锚点按 DEFAULT_GRID_COLS（15）折算：0 起是第 0 行，15 起是第 1 行，依此类推。
+ * 锚点按电脑档预设的 15 列折算：0 起是第 0 行，15 起是第 1 行，依此类推。
  * 跨格方块只写在锚点槽位上，被它覆盖的槽位留 null——那是 stores/grid 的不变量，
  * 见那里 coverage 的注释。
  *
@@ -135,6 +141,44 @@ const GRID_SEEDS: GridSeed[] = [
   { anchor: 30, tile: { kind: 'widget', name: '', widgetId: 'todo', spanW: 3, spanH: 2 } },
 ]
 
+/**
+ * 手机档的播种表。
+ *
+ * **现在是空的，等用户在手机上自己摆。** 布局是**内容**而不是取舍（见文件头），
+ * 猜一张出来只会得到一张没人用的图。摆好之后回读 `leisure-hub:grid@mobile`
+ * 转成这张表：存档是**扁平 slots**（长度 cols * rows，大方块只写在锚点槽位、
+ * 被覆盖的槽位留 null），按锚点下标折算即可，形状与上面的 GRID_SEEDS 相同。
+ * 同时把存档里的 rows 写进 PROFILE_PRESETS.mobile 的 rows 与 area.rows——三处一致。
+ *
+ * 空表期间手机档首次打开是一片空网格：右键任意格子就能加方块，
+ * 与「网格里有什么」无关的那些行为（resize、切档、引用计数、检测）都不受影响。
+ *
+ * 摆的时候有三条硬约束，违反了不会报错、只会表现为「方块不见了」：
+ *
+ * - **每个方块宽 ≤ 3**（就是列数）。宽 4 的在 3 列里放不下，直接进 overflow 暂存。
+ * - **搜索方块宽取 2 或 3**：wMin 是 2（SEARCH_SPAN_LIMITS），1 会被 tileSpan 提到 2。
+ *   3 宽（265px）够 chips 带名称显示（需 241px），2 宽（170px）会收成只有图标。
+ * - **组件不起名**（`name: ''`）：它们自己画着标题，方格下再挂一行文字是重复，
+ *   而且没起名的方格会长到名称行处、正好占满整格（差 26px）。
+ */
+const MOBILE_SEEDS: GridSeed[] = [
+  { anchor: 0, tile: { kind: 'widget', name: '', widgetId: 'calendar', spanW: 4, spanH: 2, props: { bgColor: '#0000004c' } } },
+  { anchor: 8, tile: { kind: 'widget', name: '', widgetId: 'search', spanW: 4, spanH: 1, props: { bgColor: '#00000080', engineId: 'bing' } } },
+  { anchor: 12, tile: { kind: 'widget', name: '', widgetId: 'weather', spanW: 4, spanH: 2, props: { bgColor: '#0000004c', lat: 22.2082, lon: 113.4569 } } },
+  { anchor: 20, tile: { kind: 'link', name: 'DeepSeek', url: 'https://chat.deepseek.com/', icon: 'https://fe-static.deepseek.com/chat/favicon.svg', spanW: 1, spanH: 1 } },
+  { anchor: 21, tile: { kind: 'link', name: 'BiliBili', url: 'https://www.bilibili.com/', icon: 'https://www.bilibili.com/favicon.ico', spanW: 1, spanH: 1 } },
+  { anchor: 22, tile: { kind: 'link', name: 'Turing158博客', url: 'https://blog.turing158.cc.cd/', icon: 'https://blog.turing158.cc.cd/icons/favicon.png', spanW: 1, spanH: 1 } },
+  { anchor: 23, tile: { kind: 'link', name: 'GitHub', url: 'https://github.com/', icon: 'https://github.githubassets.com/favicons/favicon-dark.png', spanW: 1, spanH: 1 } },
+  { anchor: 24, tile: { kind: 'link', name: 'StackOverflow', url: 'https://stackoverflow.com/', icon: 'https://cdn.sstatic.net/Sites/stackoverflow/Img/favicon.ico', spanW: 1, spanH: 1 } },
+  { anchor: 28, tile: { kind: 'widget', name: '', widgetId: 'todo', spanW: 4, spanH: 2 } },
+]
+
+/** 按预设取播种表；新增预设时这里加一行，不必改 buildDefaultGrid */
+const SEEDS_BY_PRESET: Record<ProfilePreset, GridSeed[]> = {
+  desktop: GRID_SEEDS,
+  mobile: MOBILE_SEEDS,
+}
+
 /** 首条待办的正文：空清单会让待办方块只显示一句「还没有待办」，不如给个可勾掉的示例 */
 const TODO_SEEDS = ['新增一条代办吧！']
 
@@ -153,17 +197,20 @@ const WALLPAPER =
  *
  * 返回 cols / rows 而不让调用方自己拼：slots 的长度必须严格等于 cols * rows
  * （stores/grid 的 load 会校验并整份丢弃），三者只能一处产出。
+ *
+ * 入参是**预设**而不是「当前档」：调用方（grid.seedDefaults）从索引里取当前档的
+ * preset 传进来，于是「重置为默认」回到的是**这个档自己的**预设，而不是电脑档。
  */
-export function buildDefaultGrid(): { cols: number; rows: number; slots: (Tile | null)[] } {
-  const slots: (Tile | null)[] = Array.from(
-    { length: DEFAULT_GRID_COLS * DEFAULT_GRID_ROWS },
-    () => null,
-  )
-  for (const seed of GRID_SEEDS) {
+export function buildDefaultGrid(
+  preset: ProfilePreset,
+): { cols: number; rows: number; slots: (Tile | null)[] } {
+  const { cols, rows } = PROFILE_PRESETS[preset]
+  const slots: (Tile | null)[] = Array.from({ length: cols * rows }, () => null)
+  for (const seed of SEEDS_BY_PRESET[preset]) {
     // id 每次现取而不是写死常量：撤销删除会把带原 id 的方块放回来，写死会撞 v-for 的 key
     slots[seed.anchor] = { ...seed.tile, id: nanoid() } as Tile
   }
-  return { cols: DEFAULT_GRID_COLS, rows: DEFAULT_GRID_ROWS, slots }
+  return { cols, rows, slots }
 }
 
 /** 默认待办清单。createdAt 取当下而不是写死时间戳：那个数只用来排序，写死会显示成很久以前 */

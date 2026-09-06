@@ -1,6 +1,9 @@
 import { computed, ref } from 'vue'
+import { ensureStorageMigrated, namespacedStorageKey } from '@/utils/storageNamespace'
 
-const STORAGE_KEY = 'starfall-hub:search-history'
+ensureStorageMigrated()
+
+const STORAGE_KEY = namespacedStorageKey('search-history')
 
 /**
  * 保留条数。
