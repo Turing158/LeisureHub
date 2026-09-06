@@ -7,14 +7,13 @@ const emit = defineEmits<{
 }>()
 
 /**
- * 卡片预览分派：有标识图标的（日历 / 天气 / 搜索）画图标，其余渲染实况组件。
+ * 卡片预览分派：有标识图标的组件画图标，其余渲染实况组件。
  *
  * 多数内置组件走图标：日历占格后是今天的日期、天气没配地点时是空骨架、
- * 搜索不配引擎是一个迷你输入框、倒计时没配日期是一句「未设置日期」，这些在
- * 「挑一个放进方格」的列表里都读作噪音，换成各自的标识图标（ICON_PATHS）更清楚。
- * 未来谁想回归实况，把它的 key 从 ICON_PATHS 移掉即可；
- * 没配图标的组件走下方 <component> 的实况兜底（待办就是这一档——它的实况是一份
- * 真实清单，那正是它要展示的东西）。
+ * 搜索不配引擎是一个迷你输入框、待办的清单内容、倒计时没配日期是一句「未设置日期」，
+ * 这些在「挑一个放进方格」的列表里都读作噪音，换成各自的标识图标（ICON_PATHS）更清楚。
+ * 未来谁想回归实况，把它的 key 从 ICON_PATHS 移掉即可；未配图标的组件才走下方
+ * <component> 的实况兜底。
  */
 const ICON_PATHS: Record<string, string> = {
   /*
@@ -43,10 +42,16 @@ const ICON_PATHS: Record<string, string> = {
    */
   countdown:
     'M12 4.4a7.6 7.6 0 1 1 0 15.2a7.6 7.6 0 1 1 0-15.2M12 8.4V12h3.2M10.2 2.6h3.6',
+  /*
+   * 待办：圆角清单外框 + 两行勾选项。
+   * 勾选标记让它区别于普通列表，保留与其它组件相同的单色线性笔画。
+   */
+  todo:
+    'M6 4.5h12a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2zM7.1 10.1l1.3 1.3 2.4-2.5M13 10.8h4M7.1 15.1l1.3 1.3 2.4-2.5M13 15.8h4',
 } as const
 
 /**
- * 卡片预览实况兜底的绑定（只有无图标的组件才走这一档，目前没有任何内置组件命中）。
+ * 卡片预览实况兜底的绑定（只有无图标的组件才走这一档）。
  *
  * 只传占格，不塞会落成 DOM 属性的额外键，与 TileWidget / TabWidgetEdit
  * 对未知 prop 的处理同一条理由。
@@ -74,7 +79,7 @@ function previewBindings(widget: WidgetDef): Record<string, unknown> {
     <li v-for="widget in WIDGETS" :key="widget.id">
       <button class="card" type="button" @click="emit('pick', widgetDraft(widget))">
         <!--
-          预览框内的内容：日历 / 天气 / 搜索 / 倒计时画各自的标识图标（ICON_PATHS）；
+          预览框内的内容：有标识图标的组件画各自的图标（ICON_PATHS）；
           没有配图标的组件才走实况兜底。
         -->
         <span class="card__preview">
@@ -160,7 +165,7 @@ function previewBindings(widget: WidgetDef): Record<string, unknown> {
 }
 
 /*
- * 日历 / 天气 / 搜索的标识图标。
+ * 内置组件的标识图标。
  *
  * 图标本体按短边 × 0.5 给——与 TileIcon 的 0.56 同源；居中由上方
  * .card__preview 的 flex 负责。实况兜底组件填满整框（自身 width/height

@@ -16,6 +16,7 @@ import { useGridMetrics } from '@/composables/useGridMetrics'
 import { useTileFlip } from '@/composables/useTileFlip'
 import { useGridStore } from '@/stores/grid'
 import { tileSpan, type Tile, type TileDraft } from '@/types/tile'
+import { activeProfilePreset } from '@/utils/profileKey'
 
 const emit = defineEmits<{
   /** 菜单里的「设置」：抽屉归 App 管，这里只上报意图 */
@@ -23,6 +24,8 @@ const emit = defineEmits<{
 }>()
 
 const store = useGridStore()
+/** 当前档位同时决定网格几何与触摸交互方式；切档会 reload，因此这里取一次即可。 */
+const profilePreset = activeProfilePreset()
 
 /**
  * 网格元素是方块区域本身；外层滚动容器是它的可用空间上限。
@@ -122,6 +125,7 @@ const layerTile = shallowRef<Tile | null>(null)
 const flip = useTileFlip(gridEl)
 
 const drag = useDragSort({
+  preset: profilePreset,
   // 按 slot index 定长取，被覆盖的槽位没有元素，返回 null 由命中检测跳过
   getSlotElements: () =>
     Array.from(
@@ -229,7 +233,9 @@ const menu = useContextMenu((event) => {
   items.push({ id: 'settings', label: '设置', icon: 'settings' })
 
   return items
-})
+},
+  { preset: profilePreset },
+)
 
 /** 菜单收起后清掉方格的选中态 */
 watch(menu.open, (open) => {
@@ -436,6 +442,15 @@ function onGridScroll() {
 <template>
   <div class="grid-wrap">
     <p v-if="metrics.tooSmall" class="too-small">窗口过小，建议放大窗口以获得更好体验</p>
+
+    <!-- 手机档长按反馈：触点处显示，达到阈值后由 useContextMenu 触发一次轻微震动。 -->
+    <div
+      v-if="menu.pressFeedback.visible"
+      class="press-feedback"
+      :class="{ 'is-ready': menu.pressFeedback.ready }"
+      :style="{ left: `${menu.pressFeedback.x}px`, top: `${menu.pressFeedback.y}px` }"
+      aria-hidden="true"
+    />
 
     <!--
       滚动容器与网格分开两层。
@@ -681,5 +696,55 @@ function onGridScroll() {
   font-size: var(--fs-sm);
   transform: translateX(-50%);
   pointer-events: none;
+}
+
+/* 长按触点提示：动画只表达「正在按住 / 已达到阈值」，不覆盖方块内容。 */
+.press-feedback {
+  position: fixed;
+  z-index: var(--z-tip);
+  width: 30px;
+  height: 30px;
+  border: 2px solid var(--accent);
+  border-radius: var(--r-full);
+  box-shadow: 0 0 0 4px rgb(255 255 255 / 0.1);
+  transform: translate(-50%, -50%) scale(0.62);
+  opacity: 0.85;
+  pointer-events: none;
+  animation: press-feedback-pulse 450ms var(--ease) forwards;
+}
+
+.press-feedback.is-ready {
+  border-color: var(--accent-solid);
+  box-shadow: 0 0 0 6px rgb(255 255 255 / 0.16);
+  animation: press-feedback-ready 140ms var(--ease) forwards;
+}
+
+@keyframes press-feedback-pulse {
+  0% {
+    opacity: 0.25;
+    transform: translate(-50%, -50%) scale(0.62);
+  }
+
+  70% {
+    opacity: 0.85;
+    transform: translate(-50%, -50%) scale(0.9);
+  }
+
+  100% {
+    opacity: 0.95;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+@keyframes press-feedback-ready {
+  0% {
+    opacity: 0.95;
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  100% {
+    opacity: 0.7;
+    transform: translate(-50%, -50%) scale(1.14);
+  }
 }
 </style>

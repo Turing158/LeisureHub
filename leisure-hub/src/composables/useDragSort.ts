@@ -1,9 +1,13 @@
 import { computed, ref } from 'vue'
 
+import type { ProfilePreset } from '@/types/profile'
 import { MOTION_BASE_MS, motionDisabled } from '@/utils/motion'
 
 /** 位移超过该阈值才算拖拽；未超过的 pointerup 判定为点击 */
 const DRAG_THRESHOLD = 5
+
+/** 手机档需要先长按，之后移动才进入拖拽 */
+const MOBILE_LONG_PRESS_MS = 450
 
 /** 拖拽期间浮层的放大比例 */
 const DRAG_SCALE = 1.06
@@ -42,6 +46,8 @@ interface GridGeometry {
 }
 
 interface DragSortOptions {
+  /** 当前配置档类型；手机档触摸拖拽需要长按确认 */
+  preset?: ProfilePreset
   /** 返回全部槽位元素，顺序与 slots 索引一致 */
   getSlotElements: () => (HTMLElement | null)[]
   /**
@@ -99,9 +105,12 @@ export function useDragSort(options: DragSortOptions) {
   let rects: (DOMRect | null)[] = []
   let rafId: number | null = null
   let settleTimer: number | null = null
+  let mobileDragTimer: number | null = null
+  let mobileDragReady = false
   let pendingEvent: PointerEvent | null = null
   let activeEl: HTMLElement | null = null
   let activePointerId: number | null = null
+  let activePointerType: string | null = null
   /**
    * 发起按下时的完整 StartContext。
    *
@@ -163,6 +172,10 @@ export function useDragSort(options: DragSortOptions) {
       rafId = null
     }
     detachWindowListeners()
+    if (mobileDragTimer !== null) {
+      clearTimeout(mobileDragTimer)
+      mobileDragTimer = null
+    }
     if (activeEl && activePointerId !== null && activeEl.hasPointerCapture(activePointerId)) {
       activeEl.releasePointerCapture(activePointerId)
     }
@@ -170,6 +183,8 @@ export function useDragSort(options: DragSortOptions) {
     pendingEvent = null
     activeEl = null
     activePointerId = null
+    activePointerType = null
+    mobileDragReady = false
     activeCtx = null
   }
 
@@ -332,7 +347,18 @@ export function useDragSort(options: DragSortOptions) {
     startY = event.clientY
     activeEl = ctx.el
     activePointerId = event.pointerId
+    activePointerType = event.pointerType
     activeCtx = ctx
+
+    const needsLongPress = options.preset === 'mobile' && event.pointerType === 'touch'
+    mobileDragReady = !needsLongPress
+    if (needsLongPress) {
+      mobileDragTimer = window.setTimeout(() => {
+        if (phase.value === 'pending' && activePointerId === event.pointerId) {
+          mobileDragReady = true
+        }
+      }, MOBILE_LONG_PRESS_MS)
+    }
     /*
      * 立即捕获（常态）还是暂缓到越过阈值（内部有控件的方块），
      * 由发起方在 StartContext 上声明，这里不感知方块内容。
@@ -349,6 +375,11 @@ export function useDragSort(options: DragSortOptions) {
 
     if (phase.value === 'pending') {
       const moved = Math.hypot(event.clientX - startX, event.clientY - startY)
+      if (options.preset === 'mobile' && activePointerType === 'touch' && !mobileDragReady) {
+        // 手机短按滑动只取消本次整理，只有长按后再移动才是整理方块。
+        if (moved > DRAG_THRESHOLD) reset()
+        return
+      }
       if (moved <= DRAG_THRESHOLD) return
       beginDrag(ctx)
       return
@@ -358,8 +389,13 @@ export function useDragSort(options: DragSortOptions) {
     if (rafId === null) rafId = requestAnimationFrame(flushMove)
   }
 
-  function onPointerUp(_event: PointerEvent, ctx: StartContext) {
+  function onPointerUp(event: PointerEvent, ctx: StartContext) {
     if (ctx.el !== activeEl) return
+    // 手机长按菜单会在捕获阶段 preventDefault，不能再把这次按下当作点击。
+    if (event.defaultPrevented) {
+      reset()
+      return
+    }
     if (phase.value === 'pending') {
       const index = ctx.index
       reset()
