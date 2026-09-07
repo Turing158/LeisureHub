@@ -6,6 +6,9 @@ import { activePresetDef } from '@/utils/profileKey'
 /** 方格内容的种类，决定渲染方式与后续可编辑字段 */
 export type TileKind = 'link' | 'widget'
 
+/** 方格进入回收站的原因。旧版只有 overflow，因此缺省按容量不足处理。 */
+export type RecycleReason = 'capacity' | 'deleted'
+
 /** 占格尺寸上限：默认网格只有 8 列 4 行，再大就会吃掉整屏 */
 export const SPAN_MAX = 4
 
@@ -99,6 +102,19 @@ function capWidthToGrid(limits: SpanLimits, widgetId: string): SpanLimits {
   return { ...limits, wMax: Math.max(limits.wMin, gridCols.value) }
 }
 
+/**
+ * 取不依赖当前网格的占格范围。
+ *
+ * 回收站里的方格要保留原来的尺寸，不能因为暂时放在较窄的网格里就被夹小；
+ * 搜索方格尤其如此，它的可用宽度上限虽然跟随当前网格，但存档尺寸本身仍应保留。
+ */
+function storedSpanLimits(tile: { kind?: TileKind; widgetId?: string } | null | undefined): SpanLimits {
+  if (tile?.kind === 'widget' && tile.widgetId) {
+    return WIDGET_SPAN_LIMITS[tile.widgetId] ?? DEFAULT_SPAN_LIMITS
+  }
+  return DEFAULT_SPAN_LIMITS
+}
+
 interface TileBase {
   /** nanoid，拖拽与列表 key 使用 */
   id: string
@@ -115,6 +131,10 @@ interface TileBase {
    */
   spanW?: number
   spanH?: number
+  /** 仅在回收站条目上存在；放回网格前会被移除。 */
+  recycleReason?: RecycleReason
+  /** 主动删除前的锚点，撤销时优先尝试放回这里。 */
+  recycleOrigin?: number
 }
 
 /** 自定义链接 */
@@ -197,6 +217,17 @@ export function tileSpan(
   }
 }
 
+/** 读取回收站方格的原始尺寸，不按当前网格列数收窄搜索方格的宽度。 */
+export function tileSpanForOverflow(
+  tile: Pick<TileBase, 'spanW' | 'spanH'> & { kind?: TileKind; widgetId?: string },
+): { w: number; h: number } {
+  const limits = storedSpanLimits(tile)
+  return {
+    w: clampSpan(tile.spanW, limits.wMin, limits.wMax),
+    h: clampSpan(tile.spanH, limits.hMin, limits.hMax),
+  }
+}
+
 /** 持久化结构 */
 export interface GridState {
   /** schema 版本，为将来迁移留口 */
@@ -205,7 +236,7 @@ export interface GridState {
   rows: number
   /** 定长数组，length === cols * rows，空位为 null */
   slots: (Tile | null)[]
-  /** 网格缩小时挤出的方块，等网格变大再放回 */
+  /** 回收站里的方块；条目通过 Tile.recycleReason 区分容量不足与主动删除 */
   overflow?: Tile[]
 }
 

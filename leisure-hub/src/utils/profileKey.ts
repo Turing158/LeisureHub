@@ -34,6 +34,7 @@ import {
   type ProfilePreset,
 } from '@/types/profile'
 import { ensureStorageMigrated, STORAGE_NAMESPACE } from '@/utils/storageNamespace'
+import { createUuid, isUuid } from '@/utils/uuid'
 
 ensureStorageMigrated()
 
@@ -153,6 +154,7 @@ function sanitizeIndex(raw: string | null): ProfileIndex | null {
     if (!Array.isArray(parsed.items)) return null
 
     const items: ProfileEntry[] = []
+    const uuids = new Set<string>()
     for (const row of parsed.items) {
       if (!row || typeof row !== 'object') continue
       const entry = row as Partial<ProfileEntry>
@@ -160,7 +162,14 @@ function sanitizeIndex(raw: string | null): ProfileIndex | null {
       if (entry.id.includes('@') || entry.id.includes(':')) continue
       if (items.some((existing) => existing.id === entry.id)) continue
       const preset: ProfilePreset = isProfilePreset(entry.preset) ? entry.preset : 'desktop'
-      items.push({ id: entry.id, name: sanitizeName(entry.name, PRESET_LABEL[preset]), preset })
+      const uuid = isUuid(entry.uuid) && !uuids.has(entry.uuid) ? entry.uuid : createUuid()
+      uuids.add(uuid)
+      items.push({
+        id: entry.id,
+        uuid,
+        name: sanitizeName(entry.name, PRESET_LABEL[preset]),
+        preset,
+      })
     }
     if (items.length === 0) return null
 
@@ -186,8 +195,8 @@ function persistIndex(state: ProfileIndex): void {
 }
 
 /** 按预设造一档；id 由调用方给（首次实例化用字面量，新增用 nanoid） */
-function entryOf(id: string, preset: ProfilePreset, name?: string): ProfileEntry {
-  return { id, name: sanitizeName(name, PRESET_LABEL[preset]), preset }
+function entryOf(id: string, preset: ProfilePreset, name?: string, uuid = createUuid()): ProfileEntry {
+  return { id, uuid, name: sanitizeName(name, PRESET_LABEL[preset]), preset }
 }
 
 /**
@@ -302,6 +311,8 @@ function ensure(): ProfileIndex {
 
   // 顺序要紧：先认领无后缀的老存档，它比按档键更旧
   index = sanitizeIndex(readRaw(INDEX_KEY)) ?? claimLegacy() ?? recoverFromKeys() ?? seedFresh()
+  // Persist normalized entries so profiles created before UUID support receive a stable identity.
+  persistIndex(index)
   return index
 }
 
@@ -328,6 +339,43 @@ export function activePresetDef(): PresetDef {
 /** 档位列表的快照；调用方不得原地改它 */
 export function listProfiles(): ProfileEntry[] {
   return ensure().items.map((item) => ({ ...item }))
+}
+
+/**
+ * 按 UUID 合并外部导入的配置档，返回 UUID 到本地寻址 id 的对照表。
+ *
+ * UUID 是导出文件与本地配置档之间的稳定身份：命中时保留本地 id，
+ * 这样原有 `:grid@<id>` / `:settings@<id>` 的寻址不会中途换名；没命中才
+ * 分配新 id。是否允许覆盖由 UI 在调用前确认，这里只执行已经确认的合并。
+ */
+export function upsertProfilesByUuid(
+  incoming: readonly Pick<ProfileEntry, 'uuid' | 'name' | 'preset'>[],
+): Map<string, string> {
+  const state = ensure()
+  const items = [...state.items]
+  const idsByUuid = new Map<string, string>()
+
+  for (const source of incoming) {
+    const index = items.findIndex((item) => item.uuid === source.uuid)
+    if (index >= 0) {
+      const current = items[index]
+      items[index] = {
+        ...current,
+        name: sanitizeName(source.name, PRESET_LABEL[source.preset]),
+        preset: source.preset,
+      }
+      idsByUuid.set(source.uuid, current.id)
+      continue
+    }
+
+    const id = nanoid()
+    items.push(entryOf(id, source.preset, source.name, source.uuid))
+    idsByUuid.set(source.uuid, id)
+  }
+
+  state.items = items
+  persistIndex(state)
+  return idsByUuid
 }
 
 /* ── 对外的写 ───────────────────────────────────────── */

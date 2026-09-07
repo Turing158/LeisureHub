@@ -2,7 +2,10 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 
 import OverlayLayer from '../OverlayLayer.vue'
+import UndoToast from '../UndoToast.vue'
+import TileIcon from '../TileIcon.vue'
 import ColorPicker from '../dialog/ColorPicker.vue'
+import CloudSyncDialog from '../dialog/CloudSyncDialog.vue'
 import ConfirmDialog from '../dialog/ConfirmDialog.vue'
 import CustomEngines from './CustomEngines.vue'
 import NumberField from './NumberField.vue'
@@ -12,7 +15,9 @@ import { autoFit } from '@/composables/useAreaViewport'
 import { resetSearchHistory, useSearchHistory } from '@/composables/useSearchHistory'
 import { resetTodos } from '@/composables/useTodos'
 import { clearWeatherCache } from '../widgets/weather/cache'
+import { getWidget } from '@/data/widgets'
 import { useGridStore } from '@/stores/grid'
+import { tileSpanForOverflow, type Tile } from '@/types/tile'
 import {
   AREA_CELL_MAX,
   AREA_CELL_MIN,
@@ -43,6 +48,13 @@ import {
   type ProfileEntry,
 } from '@/types/profile'
 import { normalizeHex } from '@/utils/color'
+import {
+  applyConfigImport,
+  configImportConflicts,
+  downloadConfigSnapshot,
+  parseConfigImport,
+  type ParsedConfigImport,
+} from '@/utils/exportConfig'
 import {
   activeProfileId,
   createProfile,
@@ -165,9 +177,30 @@ function removeProfileTitle(id: string): string {
 /** 待确认删除的档位 id；null 表示没有待确认的删除 */
 const confirmRemoveId = ref<string | null>(null)
 
+const cloudSyncOpen = ref(false)
+const configFileInput = ref<HTMLInputElement | null>(null)
+const configImportBusy = ref(false)
+const configImportError = ref('')
+const pendingConfigImport = ref<ParsedConfigImport | null>(null)
+const importConflictNames = ref<string[]>([])
+const recycleNotice = ref('')
+const confirmRecycleDeleteId = ref<string | null>(null)
+
 const confirmRemoveName = computed(
   () => profiles.value.find((item) => item.id === confirmRemoveId.value)?.name ?? '',
 )
+
+const confirmRecycleDeleteName = computed(() => {
+  const tile = grid.overflow.find((item) => item.id === confirmRecycleDeleteId.value)
+  return tile ? tileDisplayName(tile) : ''
+})
+
+const importConflictMessage = computed(() => {
+  const count = importConflictNames.value.length
+  const names = importConflictNames.value.slice(0, 3).map((name) => `「${name}」`).join('、')
+  const remainder = count > 3 ? ` 等 ${count} 个配置` : ''
+  return `检测到 UUID 相同的配置 ${names}${remainder}。要用文件中的方块布局与外观设置覆盖它们吗？导入后页面会重新载入。`
+})
 
 /**
  * 删档。
@@ -186,6 +219,115 @@ function doRemoveProfile() {
   if (!id || !removeProfile(id)) return
   refreshProfiles()
   void pruneImagesAfterProfileRemoval()
+}
+
+function downloadCurrentConfig() {
+  settings.persist()
+  settings.persistGlobal()
+  grid.persist()
+  downloadConfigSnapshot()
+}
+
+function openConfigFilePicker() {
+  configImportError.value = ''
+  pendingConfigImport.value = null
+  importConflictNames.value = []
+  if (!configFileInput.value) return
+  configFileInput.value.value = ''
+  configFileInput.value.click()
+}
+
+function commitConfigImport(config: ParsedConfigImport) {
+  try {
+    applyConfigImport(config)
+    pendingConfigImport.value = null
+    importConflictNames.value = []
+    location.reload()
+  } catch {
+    configImportError.value = '加载配置失败，浏览器无法写入本地存储'
+  }
+}
+
+async function onConfigFileChange(event: Event) {
+  const input = event.currentTarget as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+
+  configImportError.value = ''
+  pendingConfigImport.value = null
+  importConflictNames.value = []
+  if (!file.name.toLowerCase().endsWith('.json')) {
+    configImportError.value = '只能加载 JSON 文件'
+    return
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    configImportError.value = '配置文件不能超过 10 MB'
+    return
+  }
+
+  configImportBusy.value = true
+  try {
+    let raw: unknown
+    try {
+      raw = JSON.parse(await file.text())
+    } catch {
+      throw new Error('JSON 格式错误，无法解析')
+    }
+    const config = parseConfigImport(raw)
+    const conflicts = configImportConflicts(config)
+    if (conflicts.length > 0) {
+      pendingConfigImport.value = config
+      importConflictNames.value = conflicts.map((profile) => profile.name)
+      return
+    }
+    commitConfigImport(config)
+  } catch (error) {
+    configImportError.value = error instanceof Error ? error.message : '加载配置失败'
+  } finally {
+    configImportBusy.value = false
+  }
+}
+
+function confirmConfigOverwrite() {
+  const config = pendingConfigImport.value
+  if (config) commitConfigImport(config)
+}
+
+function tileDisplayName(tile: Tile): string {
+  const name = tile.name.trim()
+  if (name) return name
+  if (tile.kind === 'widget') return getWidget(tile.widgetId)?.name ?? '未知组件'
+  return '未命名链接'
+}
+
+function recycleTileMeta(tile: Tile): string {
+  const { w, h } = tileSpanForOverflow(tile)
+  return `${w} × ${h}`
+}
+
+function recycleTileReason(tile: Tile): 'capacity' | 'deleted' {
+  return tile.recycleReason === 'deleted' ? 'deleted' : 'capacity'
+}
+
+function recycleTileReasonLabel(tile: Tile): string {
+  return recycleTileReason(tile) === 'deleted' ? '主动删除' : '格子不够放'
+}
+
+function recycleTileTypeLabel(tile: Tile): string {
+  return tile.kind === 'widget' ? getWidget(tile.widgetId)?.name ?? '内置组件' : '链接'
+}
+
+function restoreRecycleTile(id: string) {
+  const tile = grid.overflow.find((item) => item.id === id)
+  if (grid.restoreOverflowTile(id, tile?.recycleOrigin)) return
+  recycleNotice.value = '当前格子数量或连续空位不足，无法恢复这个方格'
+}
+
+function deleteRecycleTile() {
+  const id = confirmRecycleDeleteId.value
+  confirmRecycleDeleteId.value = null
+  if (id) grid.removeOverflowTile(id)
 }
 
 const BG_MODE_OPTIONS: { value: BgMode; label: string }[] = [
@@ -239,28 +381,17 @@ const rotateOn = computed(() => settings.bgRotate[settings.bgMode])
 const rotateInterval = computed(() => settings.bgInterval[settings.bgMode])
 
 /**
- * 纯色档能不能多选，由轮换开关决定。
+ * 轮换开关只决定颜色列表的选择语义，不限制颜色列表本身的容量。
  *
- * 只剩纯色档还受这个限制。图片两档已经放开，一律按硬上限 BG_IMAGE_MAX 收：那两档的列表是
- * 一个图库，攒着不用没有害处，关着轮换时由用户点选用哪一张。颜色不同——
- * 色板是即点即用的，多选态下「点一下」的含义从「换成这个」变成「加进轮换组」，
- * 同一个手势两种结果，得有个开关把两态分开。
- *
- * 开关本身不要求已有 ≥2 帧：否则「没第二项不让开开关，开关没开不让选第二个色」
- * 会互相锁死。开着但只有一帧时 store 的 bgRotating 自然是 false（那边要求 ≥2 帧），
- * 表现为「开了但还没得转」，由 hint 说出来。
+ * 纯色档和图片档一样，颜色可以先添加多个，再决定是否自动轮换；关闭轮换时仍保留
+ * 列表，只显示当前选中的那一项。这样新增第二个自定义色不会意外覆盖第一个。
  */
 const colorMulti = computed(() => rotateOn.value)
 
 const rotateHint = computed(() => {
   if (!rotateOn.value) {
-    /*
-     * 关着的时候说清楚开关管的是什么。
-     *
-     * 纯色档单独一句：那边开关还兼着「能不能多选」，只讲间隔会让用户在色板上
-     * 点第二个颜色没反应时无处可查。图片两档已经没有这层含义，直说轮换即可。
-     */
-    if (settings.bgMode === 'color') return '开启后可选多个颜色，定时轮换'
+    /* 关着的时候说清楚开关控制的是自动轮换，而不是列表容量。 */
+    if (settings.bgMode === 'color') return '开启后在已添加的颜色之间定时轮换'
     return '开启后在已添加的图片之间定时轮换'
   }
   // 开着但还凑不满两帧：说清楚现在没在转，以及差什么
@@ -279,22 +410,28 @@ const rotateHint = computed(() => {
 
 /* ── 纯色档 ───────────────────────────────── */
 
-/** 预设是否已在轮换组里；两边都归一后再比，6 位与 8 位写法才对得上 */
+/** 颜色是否在列表中；两边都归一后再比，6 位与 8 位写法才对得上 */
 function isColorPicked(color: string) {
   const norm = normalizeHex(color)
   return norm ? settings.bgColors.includes(norm) : false
 }
 
+/** 关闭轮换时只标出当前帧，开启轮换时标出列表中的每一帧 */
+function isColorActive(color: string) {
+  const norm = normalizeHex(color)
+  if (!norm) return false
+  return colorMulti.value ? isColorPicked(norm) : settings.bgCurrentKey === `c:${norm}`
+}
+
 /**
- * 点色板：开了轮换是多选（点中的取消选中），没开是单选（整组换成这一个）。
+ * 点色板：开了轮换是多选（点中的取消选中），没开则选中或追加一个颜色。
  *
- * 单选态不能走 toggleBgColor：它只剩一个颜色时会拒绝移除（纯色档必须有底色），
- * 于是点第二个颜色变成「两个都在组里」——看着像换了颜色，实际上攒了一组，
- * 一开轮换就全冒出来。
+ * 单选态也保留已有颜色列表，避免点第二个颜色时把自定义色一并清掉；当前帧由
+ * bgPick 记录，关闭轮换时只显示这一帧。
  */
 function onColorClick(color: string) {
   if (colorMulti.value) settings.toggleBgColor(color)
-  else settings.setBgColorOnly(color)
+  else settings.addBgColor(color)
 }
 
 /** 自定义色（不在预设表里的那些）单独列出来，它们要能被改和删 */
@@ -332,6 +469,8 @@ function openColorAdd(event: MouseEvent) {
 
 /** 点已有的自定义色：改它 */
 function openColorEdit(event: MouseEvent, color: string) {
+  // 单选态下点自定义色先把它设为当前帧，再打开面板编辑。
+  if (!colorMulti.value) settings.addBgColor(color)
   editingIndex.value = settings.bgColors.indexOf(color)
   pickerDraft.value = color
   pickerAnchor.value = anchorFrom(event)
@@ -347,9 +486,8 @@ function openColorEdit(event: MouseEvent, color: string) {
 function onPickerInput(next: string) {
   pickerDraft.value = next
   if (editingIndex.value < 0) {
-    // 单选态下这一帧就把整组换掉，之后同样转为改第 0 项
-    if (colorMulti.value) settings.addBgColor(next)
-    else settings.setBgColorOnly(next)
+    // 新增态始终追加；是否轮换由下方开关决定，不应覆盖已有颜色。
+    settings.addBgColor(next)
     editingIndex.value = settings.bgColors.indexOf(normalizeHex(next) ?? next)
     return
   }
@@ -802,113 +940,6 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
         </header>
 
         <div class="drawer__body">
-          <!--
-            ── 配置档 ─────────────────────────────
-
-            排在最前面，与钉在最底下的「重置」正好相反：重置是一个**作用于**全部
-            设置项的动作，配置档是这些设置项的**作用域**。作用域在前、动作在后——
-            放到底下的后果是用户改完二十项才发现自己改的是另一个档。
-
-            四个操作全部沿用抽屉里已有的形状，一个新组件都不做：切换是网络地址那行
-            的 `.url-row__pick`（同一颗勾、同一套禁用即选中的语义），重命名是行内
-            输入框，删除是 `__del` + 已在场的 ConfirmDialog，新增是 `.actions` 里的
-            ghost 按钮。刻意**不用 SegmentedControl**——那是给 2–3 个固定选项的
-            （三个背景档、三个动画档），而配置档数量不定、还能改名，竖排行列表同时
-            解决了「名字多长都放得下」。
-          -->
-          <section class="group">
-            <h3 class="group__title">配置档</h3>
-
-            <div class="url-list">
-              <div v-for="item in profiles" :key="item.id" class="url-row">
-                <input
-                  :id="`profile-name-${item.id}`"
-                  v-model="nameDrafts[item.id]"
-                  class="field__input url-row__input"
-                  type="text"
-                  :maxlength="PROFILE_NAME_MAX"
-                  :aria-label="`配置名称：${item.name}`"
-                  @change="commitProfileName(item.id)"
-                  @keydown.enter.prevent="commitProfileName(item.id)"
-                />
-                <!--
-                  切换：与地址行那颗勾同款，已选中的那个禁用——它本身就是
-                  「正在用这个」的标记，留着可点只会让人怀疑没生效。
-                  title 里写明会重新载入页面：这是抽屉里唯一一个有这种副作用的按钮。
-                -->
-                <button
-                  class="url-row__pick"
-                  type="button"
-                  :disabled="item.id === currentProfileId"
-                  :aria-pressed="item.id === currentProfileId"
-                  :title="
-                    item.id === currentProfileId ? '正在使用这个配置' : '切过去（会重新载入页面）'
-                  "
-                  :aria-label="
-                    item.id === currentProfileId
-                      ? `${item.name} 正在使用中`
-                      : `切换到 ${item.name}，页面会重新载入`
-                  "
-                  @click="pickProfile(item.id)"
-                >
-                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                    <path
-                      stroke="currentColor"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      stroke-width="2.4"
-                      d="m5 13 4 4L19 7"
-                    />
-                  </svg>
-                </button>
-                <!-- 两条拒绝（当前档、只剩一档）都禁用 + title 说明，不做成点了没反应 -->
-                <button
-                  class="url-row__del"
-                  type="button"
-                  :disabled="!canRemoveProfile(item.id)"
-                  :title="removeProfileTitle(item.id)"
-                  :aria-label="`删除配置 ${item.name}`"
-                  @click="confirmRemoveId = item.id"
-                >
-                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                    <path
-                      stroke="currentColor"
-                      stroke-linecap="round"
-                      stroke-width="2"
-                      d="M6 6l12 12M18 6L6 18"
-                    />
-                  </svg>
-                </button>
-              </div>
-            </div>
-
-            <!--
-              三个按钮而不是一个：一个按钮就得再问一次「基于什么」，那要么开一个新
-              对话框、要么在行内塞一个下拉。前两个按 PRESET_ORDER 铺开，加第三个
-              预设时这里不必改。「复制当前配置」是其中最有用的一个——想要「电脑档，
-              但换一张壁纸」时不必从头摆一遍布局。
-            -->
-            <div class="actions actions--wrap">
-              <button
-                v-for="preset in PRESET_ORDER"
-                :key="preset"
-                class="btn btn--ghost"
-                type="button"
-                @click="addProfile(preset)"
-              >
-                从{{ PRESET_LABEL[preset] }}预设新建
-              </button>
-              <button class="btn btn--ghost" type="button" @click="copyProfile">
-                复制当前配置
-              </button>
-            </div>
-
-            <p class="group__hint">
-              每个配置各有一套方块布局与外观设置；待办、搜索记录与搜索的三个开关由
-              所有配置共用。新建的配置不会自动切过去，切换配置会重新载入页面。
-            </p>
-          </section>
-
           <!-- ── 背景 ─────────────────────────────── -->
           <section class="group">
             <h3 class="group__title">背景</h3>
@@ -930,9 +961,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                   v-for="preset in BG_PRESETS"
                   :key="preset.value"
                   class="swatch"
-                  :class="{ 'is-active': isColorPicked(preset.value) }"
+                  :class="{ 'is-active': isColorActive(preset.value) }"
                   type="button"
-                  :aria-pressed="isColorPicked(preset.value)"
+                  :aria-pressed="isColorActive(preset.value)"
                   :title="preset.label"
                   :style="{ backgroundColor: preset.value }"
                   @click="onColorClick(preset.value)"
@@ -959,20 +990,38 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                 <!-- 自定义色：点开面板改，右上角的 x 移除 -->
                 <span v-for="color in customColors" :key="color" class="swatch-slot">
                   <button
-                    class="swatch swatch--custom is-active"
+                    class="swatch swatch--custom"
+                    :class="{ 'is-active': isColorActive(color) }"
                     type="button"
+                    :aria-pressed="isColorActive(color)"
                     :title="`自定义颜色 ${color}`"
                     :style="{ backgroundColor: color }"
                     @click="openColorEdit($event, color)"
                   >
                     <span class="sr-only">编辑自定义颜色 {{ color }}</span>
+                    <svg
+                      v-if="isColorActive(color)"
+                      class="swatch__tick"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      aria-hidden="true"
+                    >
+                      <path
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        stroke-width="2.4"
+                        d="m5 13 4 4L19 7"
+                      />
+                    </svg>
                   </button>
                   <button
                     class="swatch-slot__del"
                     type="button"
                     :disabled="settings.bgColors.length <= 1"
                     :aria-label="`移除颜色 ${color}`"
-                    @click="settings.removeBgColor(color)"
+                    data-color-picker-action
+                    @click.stop="settings.removeBgColor(color)"
                   >
                     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
                       <path
@@ -1000,9 +1049,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                   :title="
                     settings.bgColors.length >= BG_COLOR_MAX
                       ? `最多 ${BG_COLOR_MAX} 个颜色`
-                      : colorMulti
-                        ? '添加自定义颜色'
-                        : '换成自定义颜色'
+                      : '添加自定义颜色'
                   "
                   aria-label="添加自定义颜色"
                   @click="openColorAdd"
@@ -1022,7 +1069,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                 {{
                   colorMulti
                     ? '点色块选中或取消，选中的每个颜色都是轮换里的一帧'
-                    : '开启下方轮换背景后可多选'
+                    : '可添加多个颜色；关闭轮换时只显示当前选中的颜色'
                 }}
               </p>
             </template>
@@ -1647,6 +1694,212 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             />
           </section>
 
+          <!-- ── 回收站 ─────────────────────────── -->
+          <section class="group">
+            <h3 class="group__title">回收站</h3>
+
+            <div class="recycle-card">
+              <div v-if="grid.overflow.length > 0" class="recycle-list" role="list">
+                <article v-for="tile in grid.overflow" :key="tile.id" class="recycle-row" role="listitem">
+                  <div class="recycle-row__visual" :class="{ 'recycle-row__visual--widget': tile.kind === 'widget' }">
+                    <TileIcon
+                      v-if="tile.kind === 'link'"
+                      :name="tileDisplayName(tile)"
+                      :icon="tile.icon"
+                      :bg-color="tile.bgColor"
+                    />
+                    <svg v-else viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <rect x="4" y="4" width="6" height="6" rx="1.2" stroke="currentColor" stroke-width="1.6" />
+                      <rect x="14" y="4" width="6" height="6" rx="1.2" stroke="currentColor" stroke-width="1.6" />
+                      <rect x="4" y="14" width="6" height="6" rx="1.2" stroke="currentColor" stroke-width="1.6" />
+                      <rect x="14" y="14" width="6" height="6" rx="1.2" stroke="currentColor" stroke-width="1.6" />
+                    </svg>
+                  </div>
+
+                  <div class="recycle-row__content">
+                    <div class="recycle-row__heading">
+                      <span class="recycle-row__name">{{ tileDisplayName(tile) }}</span>
+                    </div>
+                    <div class="recycle-row__details">
+                      <span class="recycle-row__type">{{ recycleTileTypeLabel(tile) }}</span>
+                      <span class="recycle-row__separator" aria-hidden="true">·</span>
+                      <span class="recycle-row__meta">{{ recycleTileMeta(tile) }} 格</span>
+                      <span class="recycle-row__separator" aria-hidden="true">·</span>
+                      <span
+                        class="recycle-row__reason"
+                        :class="{ 'recycle-row__reason--deleted': recycleTileReason(tile) === 'deleted' }"
+                      >
+                        {{ recycleTileReasonLabel(tile) }}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div class="recycle-row__actions" aria-label="回收站操作">
+                    <button
+                      class="recycle-row__button recycle-row__button--restore"
+                      type="button"
+                      :aria-label="`恢复 ${tileDisplayName(tile)}`"
+                      title="恢复到网格"
+                      @click="restoreRecycleTile(tile.id)"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path
+                          stroke="currentColor"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          stroke-width="1.8"
+                          d="M9 8H5V4M5.5 8.5A7 7 0 1 1 5 13"
+                        />
+                      </svg>
+                    </button>
+                    <button
+                      class="recycle-row__button recycle-row__button--danger"
+                      type="button"
+                      :aria-label="`彻底删除 ${tileDisplayName(tile)}`"
+                      title="彻底删除"
+                      @click="confirmRecycleDeleteId = tile.id"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path
+                          stroke="currentColor"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          stroke-width="1.8"
+                          d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+                </article>
+              </div>
+              <div v-else class="recycle-empty" role="status">
+                <div class="recycle-empty__placeholder">
+                  <span class="recycle-empty__icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none">
+                      <path
+                        d="M4.5 8.5h15v10h-15zM3.5 5.5h17v3h-17zM9 12h6"
+                        stroke="currentColor"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        stroke-width="1.6"
+                      />
+                    </svg>
+                  </span>
+                  <span class="recycle-empty__title">回收站为空</span>
+                  <span class="recycle-empty__hint">暂时没有可恢复的方格</span>
+                </div>
+              </div>
+            </div>
+
+            <p class="group__hint">空间不足的方格会自动暂存，主动删除的方格也会保留在这里；点击恢复即可放回网格。</p>
+          </section>
+
+          <!-- ── 配置档 ─────────────────────────── -->
+          <section class="group">
+            <h3 class="group__title">配置档</h3>
+
+            <div class="url-list">
+              <div v-for="item in profiles" :key="item.id" class="url-row">
+                <input
+                  :id="`profile-name-${item.id}`"
+                  v-model="nameDrafts[item.id]"
+                  class="field__input url-row__input"
+                  type="text"
+                  :maxlength="PROFILE_NAME_MAX"
+                  :aria-label="`配置名称：${item.name}`"
+                  @change="commitProfileName(item.id)"
+                  @keydown.enter.prevent="commitProfileName(item.id)"
+                />
+                <button
+                  class="url-row__pick"
+                  type="button"
+                  :disabled="item.id === currentProfileId"
+                  :aria-pressed="item.id === currentProfileId"
+                  :title="item.id === currentProfileId ? '正在使用这个配置' : '切过去（会重新载入页面）'"
+                  :aria-label="
+                    item.id === currentProfileId
+                      ? `${item.name} 正在使用中`
+                      : `切换到 ${item.name}，页面会重新载入`
+                  "
+                  @click="pickProfile(item.id)"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2.4"
+                      d="m5 13 4 4L19 7"
+                    />
+                  </svg>
+                </button>
+                <button
+                  class="url-row__del"
+                  type="button"
+                  :disabled="!canRemoveProfile(item.id)"
+                  :title="removeProfileTitle(item.id)"
+                  :aria-label="`删除配置 ${item.name}`"
+                  @click="confirmRemoveId = item.id"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-width="2"
+                      d="M6 6l12 12M18 6L6 18"
+                    />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <div class="actions actions--wrap">
+              <button
+                v-for="preset in PRESET_ORDER"
+                :key="preset"
+                class="btn btn--ghost"
+                type="button"
+                @click="addProfile(preset)"
+              >
+                从{{ PRESET_LABEL[preset] }}预设新建
+              </button>
+              <button class="btn btn--ghost" type="button" @click="copyProfile">复制当前配置</button>
+            </div>
+
+            <p class="group__hint">
+              每个配置各有一套方块布局与外观设置；待办、搜索记录与搜索的三个开关由所有配置共用。
+            </p>
+
+            <div class="actions actions--wrap">
+              <button class="btn btn--ghost" type="button" @click="cloudSyncOpen = true">
+                云同步
+              </button>
+              <input
+                ref="configFileInput"
+                class="file-input"
+                type="file"
+                accept=".json,application/json"
+                aria-label="选择要加载的 JSON 配置文件"
+                @change="onConfigFileChange"
+              />
+              <button
+                class="btn btn--ghost"
+                type="button"
+                :disabled="configImportBusy"
+                :aria-busy="configImportBusy"
+                @click="openConfigFilePicker"
+              >
+                {{ configImportBusy ? '正在加载…' : '加载配置' }}
+              </button>
+              <button class="btn btn--ghost" type="button" @click="downloadCurrentConfig">
+                下载配置
+              </button>
+            </div>
+            <p v-if="configImportError" class="field__error" role="alert">
+              {{ configImportError }}
+            </p>
+          </section>
+
           <!--
             ── 重置 ───────────────────────────────
 
@@ -1733,6 +1986,38 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           @confirm="doReset"
           @cancel="confirmResetOpen = false"
         />
+      </OverlayLayer>
+
+      <OverlayLayer name="confirm-recycle">
+        <ConfirmDialog
+          v-if="confirmRecycleDeleteId"
+          title="彻底删除这个方格？"
+          :message="`「${confirmRecycleDeleteName}」将从回收站永久删除，无法恢复。`"
+          confirm-label="彻底删除"
+          @confirm="deleteRecycleTile"
+          @cancel="confirmRecycleDeleteId = null"
+        />
+      </OverlayLayer>
+
+      <OverlayLayer name="cloud-sync" duration="base">
+        <CloudSyncDialog v-if="cloudSyncOpen" @close="cloudSyncOpen = false" />
+      </OverlayLayer>
+
+      <OverlayLayer name="confirm">
+        <ConfirmDialog
+          v-if="pendingConfigImport"
+          title="覆盖同一个配置？"
+          :message="importConflictMessage"
+          confirm-label="覆盖并加载"
+          cancel-label="取消加载"
+          :danger="false"
+          @confirm="confirmConfigOverwrite"
+          @cancel="pendingConfigImport = null"
+        />
+      </OverlayLayer>
+
+      <OverlayLayer name="toast">
+        <UndoToast v-if="recycleNotice" :message="recycleNotice" @close="recycleNotice = ''" />
       </OverlayLayer>
 
       <!--
@@ -1961,6 +2246,259 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   color: var(--danger);
 }
 
+/* 回收站列表与空状态共用一张卡片，条目再用轻量卡片分组，状态切换时边界不跳动。 */
+.recycle-card {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--fill);
+  padding: var(--sp-2);
+}
+
+.recycle-list {
+  display: flex;
+  max-height: 280px;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: var(--sp-1);
+  gap: var(--sp-2);
+  scrollbar-width: thin;
+}
+
+.recycle-row {
+  display: grid;
+  min-height: 64px;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  border: 1px solid var(--line-subtle);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  padding: var(--sp-3);
+  gap: var(--sp-3);
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background-color var(--dur-fast) var(--ease),
+    transform var(--dur-fast) var(--ease);
+}
+
+.recycle-row:hover {
+  border-color: var(--line-strong);
+  background: var(--fill-hover);
+}
+
+.recycle-row__visual {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  flex: none;
+  overflow: hidden;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--fill-raised);
+  color: var(--color-text-dim);
+}
+
+.recycle-row__visual--widget {
+  background: color-mix(in srgb, var(--accent) 14%, var(--fill-raised));
+  color: var(--accent);
+}
+
+.recycle-row__visual svg {
+  width: 21px;
+  height: 21px;
+}
+
+.recycle-row__visual :deep(.tile-icon) {
+  border-radius: inherit;
+  font-size: 19px;
+}
+
+.recycle-row__content {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.recycle-row__heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.recycle-row__name {
+  overflow: hidden;
+  min-width: 0;
+  color: var(--color-text);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recycle-row__details {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  row-gap: var(--sp-1);
+  color: var(--color-text-faint);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+}
+
+.recycle-row__type {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recycle-row__separator {
+  padding: 0 var(--sp-1);
+  color: var(--color-text-disabled);
+}
+
+.recycle-row__meta {
+  color: var(--color-text-faint);
+}
+
+.recycle-row__reason {
+  flex: none;
+  width: fit-content;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--focus) 45%, transparent);
+  border-radius: var(--r-full);
+  color: var(--focus);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
+}
+
+.recycle-row__reason--deleted {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  color: var(--danger);
+}
+
+.recycle-row__actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.recycle-row__button {
+  position: relative;
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: var(--r-sm);
+  color: var(--color-text-faint);
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+/* 视觉图标保持紧凑，命中区域扩展到约 44px，方便触控操作。 */
+.recycle-row__button::after {
+  position: absolute;
+  content: '';
+  inset: -7px;
+}
+
+.recycle-row__button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.recycle-row__button:hover {
+  background: var(--fill-hover);
+  color: var(--color-text);
+}
+
+.recycle-row__button--restore:hover {
+  color: var(--accent);
+}
+
+.recycle-row__button--danger:hover {
+  color: var(--danger);
+}
+
+.recycle-row__button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.recycle-empty {
+  display: flex;
+  min-height: 174px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  padding: var(--sp-2);
+}
+
+.recycle-empty__placeholder {
+  display: flex;
+  width: 100%;
+  min-height: 150px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: var(--sp-2);
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  color: var(--color-text-faint);
+  font-size: var(--fs-sm);
+  text-align: center;
+}
+
+.recycle-empty__icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid var(--line-subtle);
+  border-radius: var(--r-full);
+  background: var(--fill-raised);
+  color: var(--color-text-disabled);
+}
+
+.recycle-empty__icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.recycle-empty__title {
+  color: var(--color-text-dim);
+}
+
+.recycle-empty__hint {
+  color: var(--color-text-faint);
+  font-size: var(--fs-xs);
+}
+
+@media (max-width: 360px) {
+  .recycle-row {
+    grid-template-columns: 36px minmax(0, 1fr);
+    padding: var(--sp-2);
+  }
+
+  .recycle-row__visual {
+    width: 36px;
+    height: 36px;
+  }
+
+  .recycle-row__actions {
+    grid-column: 2;
+    justify-content: flex-start;
+    margin-top: calc(var(--sp-1) * -1);
+  }
+}
+
 /* ── 色板 ─────────────────────────────────────────── */
 
 /* 固定 4 列而非 auto-fit：8 个预设正好两行，色块保持足够的点击宽度 */
@@ -2048,34 +2586,44 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
  */
 .swatch-slot__del {
   position: absolute;
+  z-index: 2;
   top: -5px;
   right: -5px;
   display: grid;
-  width: 16px;
-  height: 16px;
-  border: 1px solid var(--line-strong);
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--line);
   border-radius: 50%;
-  background: var(--surface-2);
+  background-color: var(--bg-menu);
   color: var(--color-text-dim);
   place-items: center;
-  transition:
-    color var(--dur-fast) var(--ease),
-    border-color var(--dur-fast) var(--ease);
+  touch-action: manipulation;
+  transition: background-color var(--dur-fast) var(--ease);
+}
+
+/* 视觉按钮保持紧凑，命中区扩展到约 40px，满足触控与窄色块场景。 */
+.swatch-slot__del::after {
+  position: absolute;
+  content: '';
+  inset: -8px;
 }
 
 .swatch-slot__del svg {
+  position: relative;
+  z-index: 1;
   width: 9px;
   height: 9px;
 }
 
 .swatch-slot__del:hover:not(:disabled) {
-  border-color: var(--color-text-faint);
+  background-color: var(--danger-bg);
   color: var(--danger);
 }
 
 .swatch-slot__del:disabled {
   color: var(--color-text-disabled);
-  cursor: default;
+  cursor: not-allowed;
+  opacity: 0.65;
 }
 
 .swatch-slot__del:focus-visible {
@@ -2555,6 +3103,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 .actions {
   display: flex;
   gap: var(--sp-2);
+}
+
+.file-input {
+  display: none;
 }
 
 /*

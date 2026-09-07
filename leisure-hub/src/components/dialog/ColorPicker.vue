@@ -211,6 +211,12 @@ function detach() {
 function onDownOutside(event: Event) {
   const target = event.target as HTMLElement | null
   if (target?.closest('[data-color-picker]')) return
+  // 允许颜色列表中的删除按钮在取色器打开时继续收到 click：先关闭面板，
+  // 再让明确标记的底层动作完成，避免捕获阶段拦截掉用户的删除意图。
+  if (target?.closest('[data-color-picker-action]')) {
+    onClose()
+    return
+  }
   event.preventDefault()
   event.stopPropagation()
   onClose()

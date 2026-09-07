@@ -188,8 +188,9 @@ const dropHint = computed(() => {
 /** 菜单当前作用的槽位；null 表示这次右键落在空白处 */
 const menuIndex = ref<number | null>(null)
 
-/** 删除后暂存，等撤销窗口过期才真正丢弃 */
-const undo = ref<{ index: number; tile: Tile } | null>(null)
+/** 删除后进入回收站，撤销窗口内可按原锚点恢复。 */
+const undo = ref<{ index: number; tile: Tile; recycleId: string } | null>(null)
+const notice = ref('')
 
 const menu = useContextMenu((event) => {
   // 拖拽 / 落位进行中不弹菜单：此刻方格位置还在变，菜单指向哪一格是不确定的
@@ -266,14 +267,15 @@ function onMenuSelect(id: string) {
 }
 
 /**
- * 删除走「先删 + 可撤销」而不是二次确认弹窗：
+ * 删除走「移入回收站 + 可撤销」而不是二次确认弹窗：
  * 单个方格的删除代价低，撤销条既避免了误删不可恢复，也不给每次删除加一次点击。
  */
 function removeTile(index: number) {
   const tile = store.slots[index]
   if (!tile) return
-  undo.value = { index, tile }
-  store.clearTile(index)
+  const recycleId = store.moveTileToRecycle(index)
+  if (!recycleId) return
+  undo.value = { index, tile, recycleId }
 }
 
 function undoRemove() {
@@ -281,7 +283,9 @@ function undoRemove() {
   undo.value = null
   if (!pending) return
   // 期间该格可能已被拖入别的方块，restoreTile 只在仍为空时写回
-  store.restoreTile(pending.index, pending.tile)
+  if (!store.restoreOverflowTile(pending.recycleId, pending.index)) {
+    notice.value = '当前格子空间不足，方格仍保留在回收站'
+  }
 }
 
 /* ── Dialog ───────────────────────────────────────── */
@@ -369,8 +373,17 @@ function onWidgetProps(index: number, patch: Record<string, unknown>) {
 function onSubmit(draft: TileDraft) {
   if (dialogIndex.value === null) return
   // 编辑保留原 id，新建才生成新 id
-  if (editingTile.value) store.updateTile(dialogIndex.value, draft)
-  else store.setTile(dialogIndex.value, draft)
+  const editing = editingTile.value !== undefined
+  const overflowBefore = store.overflow.length
+  const anchor = editing ? store.updateTile(dialogIndex.value, draft) : store.setTile(dialogIndex.value, draft)
+  if (anchor < 0) {
+    notice.value = editing
+      ? '当前格子数量不足，无法更新这个方格'
+      : '当前格子数量不足，方格已放入回收站'
+  } else if (store.overflow.length > overflowBefore) {
+    const added = store.overflow.length - overflowBefore
+    notice.value = `${added} 个方格无法放置，已移入回收站`
+  }
   closeDialog()
 }
 
@@ -404,7 +417,7 @@ watch(
   { flush: 'post' },
 )
 
-const undoMessage = computed(() => `已删除「${undo.value?.tile.name ?? ''}」`)
+const undoMessage = computed(() => `已删除「${undo.value?.tile.name ?? ''}」，已移入回收站`)
 
 /* ── 名称截断提示 ─────────────────────────────────── */
 
@@ -569,6 +582,7 @@ function onGridScroll() {
         @action="undoRemove"
         @close="undo = null"
       />
+      <UndoToast v-else-if="notice" :message="notice" @close="notice = ''" />
     </OverlayLayer>
   </div>
 </template>

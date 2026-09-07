@@ -8,7 +8,9 @@ import {
   defaultGridRows,
   setGridCols,
   tileSpan,
+  tileSpanForOverflow,
   type GridState,
+  type RecycleReason,
   type Tile,
   type TileDraft,
 } from '@/types/tile'
@@ -186,6 +188,10 @@ function sanitizeTile(value: unknown, keepSpan = false): Tile | null {
     const span = tileSpan(tile)
     next.spanW = span.w
     next.spanH = span.h
+  } else {
+    const span = tileSpanForOverflow(tile)
+    next.spanW = span.w
+    next.spanH = span.h
   }
   // 底色会直接进 background，非法值一律丢弃而不是照原样渲染
   if (next.kind === 'link' && next.bgColor !== undefined && !isHexColor(next.bgColor)) {
@@ -200,6 +206,32 @@ function sanitizeTile(value: unknown, keepSpan = false): Tile | null {
     if (cleaned) next.props = cleaned
     else delete next.props
   }
+  if (keepSpan) {
+    // 旧版 overflow 没有原因字段，默认就是网格空间不足。
+    next.recycleReason = next.recycleReason === 'deleted' ? 'deleted' : 'capacity'
+    if (!Number.isInteger(next.recycleOrigin) || (next.recycleOrigin as number) < 0) {
+      delete next.recycleOrigin
+    }
+  } else {
+    // 回收站元数据不应随着脏存档进入可见网格。
+    delete next.recycleReason
+    delete next.recycleOrigin
+  }
+  return next
+}
+
+function withRecycleMeta(tile: Tile, reason: RecycleReason, origin?: number): Tile {
+  const next = { ...tile }
+  next.recycleReason = reason
+  if (Number.isInteger(origin) && (origin as number) >= 0) next.recycleOrigin = origin
+  else delete next.recycleOrigin
+  return next
+}
+
+function withoutRecycleMeta(tile: Tile): Tile {
+  const next = { ...tile }
+  delete next.recycleReason
+  delete next.recycleOrigin
   return next
 }
 
@@ -377,7 +409,7 @@ export const useGridStore = defineStore('grid', () => {
       const { w, h } = tileSpan(tile)
       const spot = findFreeAnchor(w, h)
       if (spot >= 0) slots.value[spot] = tile
-      else overflow.value.push(tile)
+      else overflow.value.push(withRecycleMeta(tile, 'capacity'))
     }
   }
 
@@ -400,6 +432,17 @@ export const useGridStore = defineStore('grid', () => {
   /** 写入指定槽位，自动补 id；返回实际落位的锚点，-1 表示失败 */
   function setTile(index: number, draft: TileDraft): number {
     if (!inRange(index)) return -1
+    const requested = tileSpanForOverflow(draft)
+    if (requested.w > cols.value || requested.h > rows.value) {
+      const tile = {
+        ...cleanDraft(draft),
+        spanW: requested.w,
+        spanH: requested.h,
+        id: nanoid(),
+      } as Tile
+      overflow.value.push(withRecycleMeta(tile, 'capacity'))
+      return -1
+    }
     const span = tileSpan(draft)
     const { anchor, w, h } = resolvePlacement(index, span.w, span.h)
     const evicted = lift(occupantsIn(anchor, w, h))
@@ -414,6 +457,8 @@ export const useGridStore = defineStore('grid', () => {
     const current = slots.value[index]
     if (!current) return -1
 
+    const requested = tileSpanForOverflow(draft)
+    if (requested.w > cols.value || requested.h > rows.value) return -1
     const span = tileSpan(draft)
     const { anchor, w, h } = resolvePlacement(index, span.w, span.h)
     const evicted = lift(occupantsIn(anchor, w, h, index))
@@ -429,6 +474,17 @@ export const useGridStore = defineStore('grid', () => {
     slots.value[index] = null
   }
 
+  /** 主动删除：先移入回收站，撤销与设置里的恢复都复用同一条数据。 */
+  function moveTileToRecycle(index: number): string | null {
+    if (!inRange(index)) return null
+    const tile = slots.value[index]
+    if (!tile) return null
+    const entry = withRecycleMeta(tile, 'deleted', index)
+    slots.value[index] = null
+    overflow.value.push(entry)
+    return entry.id
+  }
+
   /**
    * 撤销删除：把带原 id 的方块放回原槽位。
    *
@@ -440,6 +496,37 @@ export const useGridStore = defineStore('grid', () => {
     const { w, h } = tileSpan(tile)
     if (!areaFree(slots.value, cols.value, rows.value, index, w, h)) return false
     slots.value[index] = tile
+    return true
+  }
+
+  /**
+   * 从回收站恢复一个方块。
+   *
+   * 只在当前网格找到能完整容纳它的空位时才移动；网格空间不足或被切碎时
+   * 保留在回收站里，让调用方可以给出明确提示，而不是静默丢弃。
+   */
+  function restoreOverflowTile(id: string, preferredIndex?: number): boolean {
+    const index = overflow.value.findIndex((tile) => tile.id === id)
+    if (index < 0) return false
+    const tile = overflow.value[index]
+    const { w, h } = tileSpanForOverflow(tile)
+    const preferred = typeof preferredIndex === 'number' && Number.isInteger(preferredIndex) ? preferredIndex : -1
+    const anchor =
+      preferred >= 0 && areaFree(slots.value, cols.value, rows.value, preferred, w, h)
+        ? preferred
+        : findFreeAnchor(w, h)
+    if (anchor < 0) return false
+
+    overflow.value = overflow.value.filter((_, i) => i !== index)
+    slots.value[anchor] = withoutRecycleMeta(tile)
+    return true
+  }
+
+  /** 永久删除回收站中的方块，不进入撤销队列。 */
+  function removeOverflowTile(id: string): boolean {
+    const next = overflow.value.filter((tile) => tile.id !== id)
+    if (next.length === overflow.value.length) return false
+    overflow.value = next
     return true
   }
 
@@ -507,17 +594,25 @@ export const useGridStore = defineStore('grid', () => {
       else displaced.push(tile)
     })
 
+    // 主动删除的条目不会因为网格变大而自动回桌面，只能由用户明确恢复。
+    const deleted = overflow.value.filter((tile) => tile.recycleReason === 'deleted')
+    const capacityOverflow = overflow.value.filter((tile) => tile.recycleReason !== 'deleted')
+
     // 先安置被挤出的，再取回历史暂存，避免旧数据插队到当前可见内容之前
-    const queue = [...displaced, ...overflow.value]
-    const rest: Tile[] = []
-    for (const tile of queue) {
-      const { w, h } = tileSpan(tile)
+    const queue = [
+      ...displaced.map((tile) => ({ tile, preserveSpan: false })),
+      ...capacityOverflow.map((tile) => ({ tile, preserveSpan: true })),
+    ]
+    const rest: Tile[] = [...deleted]
+    for (const item of queue) {
+      const { tile } = item
+      const { w, h } = item.preserveSpan ? tileSpanForOverflow(tile) : tileSpan(tile)
       let placed = false
       for (let row = 0; row + h <= nextRows && !placed; row++) {
         for (let col = 0; col + w <= nextCols && !placed; col++) {
           const anchor = row * nextCols + col
           if (!areaFree(next, nextCols, nextRows, anchor, w, h)) continue
-          next[anchor] = tile
+          next[anchor] = withoutRecycleMeta(tile)
           placed = true
         }
       }
@@ -545,7 +640,10 @@ export const useGridStore = defineStore('grid', () => {
     setTile,
     updateTile,
     clearTile,
+    moveTileToRecycle,
     restoreTile,
+    restoreOverflowTile,
+    removeOverflowTile,
     moveTile,
     resize,
     /**

@@ -108,6 +108,8 @@ export interface ProfileEntry {
    * 会捡回一份没清干净的旧存档。
    */
   id: string
+  /** Stable external identity used by exports and future cloud sync. */
+  uuid: string
   name: string
   /**
    * 出厂预设，**必须持久化**。

@@ -385,7 +385,7 @@ type StoredLocalImage = Pick<BgLocalImage, 'id' | 'name'>
  * （无后缀的 `:settings`，被 profileKey 的 claimLegacy 改名成 `@desktop`）里还带着，
  * 读盘时要能从它们迁一次。写入侧不再写。与 bgColor / bgImage 那几个旧字段同一手法。
  */
-interface SettingsState {
+export interface SettingsState {
   version: number
   bgMode: BgMode
   bgColors: string[]
@@ -422,7 +422,7 @@ interface SettingsState {
 }
 
 /** 全局那份存档的形状（`leisure-hub:global`），四个字段一律跨档共用 */
-interface GlobalState {
+export interface GlobalState {
   version: number
   suggestEnabled: boolean
   inlineCompleteEnabled: boolean
@@ -1352,11 +1352,15 @@ export const useSettingsStore = defineStore('settings', () => {
     const existing = bgColors.value.indexOf(norm)
     if (existing >= 0) {
       setBgIndex(existing)
+      bgPick.value = { ...bgPick.value, color: `c:${norm}` }
       return
     }
     if (bgColors.value.length >= BG_COLOR_MAX) return
     bgColors.value = [...bgColors.value, norm]
-    setBgIndex(bgColors.value.length - 1)
+    const at = bgColors.value.length - 1
+    setBgIndex(at)
+    // 关闭轮换时新增颜色也要成为当前帧，否则列表变化会被 watch 拉回旧颜色。
+    bgPick.value = { ...bgPick.value, color: `c:${norm}` }
   }
 
   /**
@@ -1368,7 +1372,22 @@ export const useSettingsStore = defineStore('settings', () => {
   function removeBgColor(color: string) {
     if (bgColors.value.length <= 1) return
     const norm = normalizeHex(color) ?? color
-    bgColors.value = bgColors.value.filter((item) => item !== norm && item !== color)
+    const currentColor = bgColors.value[bgIndex.value]
+    const currentIndex = bgIndex.value
+    const next = bgColors.value.filter((item) => item !== norm && item !== color)
+    bgColors.value = next
+
+    // 删除当前帧之前的颜色时，仍然把游标留在原来的颜色上，而不是按旧下标落到下一帧。
+    if (currentColor && next.includes(currentColor)) {
+      setBgIndex(next.indexOf(currentColor))
+    } else if (next.length > 0) {
+      setBgIndex(Math.min(currentIndex, next.length - 1))
+    }
+
+    // 删除当前颜色时把选择指针交给仍有效的帧，避免刷新后再次指向已删除的 key。
+    if (bgPick.value.color === `c:${norm}`) {
+      bgPick.value = { ...bgPick.value, color: next[0] ? `c:${next[0]}` : '' }
+    }
   }
 
   /**
@@ -1414,9 +1433,13 @@ export const useSettingsStore = defineStore('settings', () => {
     if (!norm || index < 0 || index >= bgColors.value.length) return
     // 与别的档重了就不写：会造成两个一模一样的色块
     if (bgColors.value.some((item, at) => item === norm && at !== index)) return
+    const previous = bgColors.value[index]
     const copy = [...bgColors.value]
     copy[index] = norm
     bgColors.value = copy
+    if (bgPick.value.color === `c:${previous}`) {
+      bgPick.value = { ...bgPick.value, color: `c:${norm}` }
+    }
   }
 
   /* ── 本地图片档 ───────────────────────────── */
@@ -2018,5 +2041,6 @@ export const useSettingsStore = defineStore('settings', () => {
     reset,
     load,
     persist,
+    persistGlobal,
   }
 })
