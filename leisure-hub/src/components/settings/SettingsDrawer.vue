@@ -971,7 +971,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                   <span class="sr-only">{{ preset.label }}</span>
                   <!-- 选中态除外圈描边外再给一个勾：一排深灰色块之间，仅靠描边不够快辨认 -->
                   <svg
-                    v-if="isColorPicked(preset.value)"
+                    v-if="isColorActive(preset.value)"
                     class="swatch__tick"
                     viewBox="0 0 24 24"
                     fill="none"
