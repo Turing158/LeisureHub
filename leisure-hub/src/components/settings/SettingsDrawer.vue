@@ -2267,8 +2267,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
 .recycle-row {
   display: grid;
+  flex: none;
   min-height: 64px;
   grid-template-columns: 42px minmax(0, 1fr) auto;
+  grid-template-areas: 'visual content actions';
   align-items: center;
   border: 1px solid var(--line-subtle);
   border-radius: var(--r-md);
@@ -2287,6 +2289,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 }
 
 .recycle-row__visual {
+  grid-area: visual;
   display: grid;
   width: 42px;
   height: 42px;
@@ -2315,6 +2318,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 }
 
 .recycle-row__content {
+  grid-area: content;
   min-width: 0;
   display: flex;
   flex: 1;
@@ -2383,6 +2387,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 }
 
 .recycle-row__actions {
+  grid-area: actions;
   display: flex;
   flex: none;
   align-items: center;
@@ -2481,8 +2486,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   font-size: var(--fs-xs);
 }
 
-@media (max-width: 360px) {
+@media (max-width: 480px) {
   .recycle-row {
+    grid-template-areas:
+      'visual content'
+      'visual actions';
     grid-template-columns: 36px minmax(0, 1fr);
     padding: var(--sp-2);
   }
@@ -2493,8 +2501,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   }
 
   .recycle-row__actions {
-    grid-column: 2;
-    justify-content: flex-start;
+    justify-content: flex-end;
     margin-top: calc(var(--sp-1) * -1);
   }
 }

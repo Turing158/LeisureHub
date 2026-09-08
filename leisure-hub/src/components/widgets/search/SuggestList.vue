@@ -6,6 +6,8 @@ const props = defineProps<{
   activeIndex: number
   /** 定位与宽度：全部来自搜索条外框的实测矩形 */
   rect: { left: number; top: number; bottom: number; width: number }
+  /** 所属搜索方块的唯一标记，供 Teleport 后的外部点击判断使用 */
+  ownerId: string
   /** listbox 自身的 id，供输入框的 aria-controls 指向 */
   listId: string
   /** 列表项 id 前缀，供输入框的 aria-activedescendant 指向 */
@@ -21,7 +23,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  /** 用 pointerdown 而非 click 提交，理由见模板里的注释 */
+  /** 用 click 提交，避免触屏滚动刚按下列表项就误选 */
   pick: [index: number]
   hover: [index: number]
 }>()
@@ -67,7 +69,13 @@ function style() {
     列表不接焦点——焦点始终留在输入框里，高亮靠输入框上的 aria-activedescendant
     指向这里的项 id。焦点跳到列表项上会让输入法状态和光标位置一起丢掉。
   -->
-  <div class="suggest" :style="style()" data-suggest role="presentation">
+  <div
+    class="suggest"
+    :style="style()"
+    data-suggest
+    :data-suggest-owner="ownerId"
+    role="presentation"
+  >
     <div class="suggest__glass" aria-hidden="true" />
 
     <ul :id="listId" class="suggest__list" role="listbox" aria-label="搜索建议">
@@ -79,7 +87,7 @@ function style() {
         :class="{ 'is-active': i === activeIndex }"
         role="option"
         :aria-selected="i === activeIndex"
-        @pointerdown.prevent="emit('pick', i)"
+        @click="emit('pick', i)"
         @mouseenter="emit('hover', i)"
       >
         <span class="suggest__icon" aria-hidden="true">

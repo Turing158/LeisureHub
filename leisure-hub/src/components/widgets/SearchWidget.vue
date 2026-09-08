@@ -253,6 +253,29 @@ const OPTION_PREFIX = `${uid}-opt`
  */
 const rect = ref({ left: 0, top: 0, bottom: 0, width: 0 })
 
+/**
+ * Teleport 后的建议列表不再是 .sw 的后代节点，不能只靠 focusout 的
+ * relatedTarget 判断「焦点是否还在搜索组件里」。这个标记让全局指针事件
+ * 能区分当前方块自己的列表、其它搜索方块的列表和真正的外部点击。
+ */
+function isOwnedSuggestTarget(target: EventTarget | null): boolean {
+  const el = target instanceof Element ? target : null
+  return el?.closest(`[data-suggest-owner="${uid}"]`) !== null
+}
+
+/**
+ * 触摸滚动建议列表时，浏览器可能先让输入框失焦；列表仍然是当前交互区域，
+ * 所以收起动作改由「点到组件外」来触发。捕获阶段要早于列表项的 pointerdown，
+ * 但列表自身通过 owner 标记被保留下来，随后仍可正常选中。
+ */
+function onGlobalPointerDown(event: PointerEvent) {
+  if (!listOpen.value) return
+  const target = event.target as Node | null
+  if (target && frameEl.value?.contains(target)) return
+  if (isOwnedSuggestTarget(event.target)) return
+  closeList()
+}
+
 function measure() {
   const el = rowEl.value
   if (!el) return
@@ -275,6 +298,7 @@ onMounted(() => {
    */
   window.addEventListener('resize', measure)
   window.addEventListener('scroll', measure, true)
+  window.addEventListener('pointerdown', onGlobalPointerDown, true)
 })
 
 onBeforeUnmount(() => {
@@ -282,6 +306,7 @@ onBeforeUnmount(() => {
   observer = null
   window.removeEventListener('resize', measure)
   window.removeEventListener('scroll', measure, true)
+  window.removeEventListener('pointerdown', onGlobalPointerDown, true)
 })
 
 /** 引擎菜单的锚点矩形：按钮自身，而不是整个方块 */
@@ -535,7 +560,7 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
-/** 点列表项提交。用 pointerdown 而非 click：click 之前会先发生 blur */
+/** 点列表项提交。列表内部的 blur 已不再收起浮层，因此可以等完整 click 再选择。 */
 function onPick(index: number) {
   const text = items.value[index]
   if (text === undefined) return
@@ -558,6 +583,15 @@ function onFocusOut(event: FocusEvent) {
   // 焦点还在方块内部（点了引擎按钮 / chip / 记录）时不收列表
   const next = event.relatedTarget as Node | null
   if (next && frameEl.value?.contains(next)) return
+  // 建议列表 Teleport 到 body；点列表项或在列表内滚动时仍属于当前交互区域
+  if (next && isOwnedSuggestTarget(next)) return
+  /*
+   * 移动端收起输入法时通常只得到 relatedTarget=null（部分浏览器会报告 body），
+   * 而没有真正离开页面。这类失焦不能关闭建议；真正的外部点击由
+   * onGlobalPointerDown 处理，键盘上的 Tab / Escape / Enter 则在各自的 keydown
+   * 分支里显式处理。
+   */
+  if (!next || next === document.body || next === document.documentElement) return
   closeList()
 }
 
@@ -747,6 +781,7 @@ watch(
         :items="items"
         :active-index="activeIndex"
         :rect="rect"
+        :owner-id="uid"
         :list-id="LIST_ID"
         :id-prefix="OPTION_PREFIX"
         :suggest-style="suggestStyle"

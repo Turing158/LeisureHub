@@ -78,6 +78,7 @@ watch(
         alt=""
         aria-hidden="true"
         draggable="false"
+        @contextmenu.prevent
         @load="status = 'ready'"
         @error="status = 'error'"
       />
@@ -97,6 +98,9 @@ watch(
   justify-content: center;
   overflow: hidden;
   border-radius: inherit;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 /*
@@ -131,9 +135,19 @@ watch(
  * --content-size 缺省时回落到 --tile-size，兼容只覆写了后者的调用方。
  */
 .tile-icon__img {
+  /*
+   * iOS Safari 长按图片会直接弹出预览 / 分享菜单。
+   * draggable=false 只关闭 HTML5 拖拽，不能关闭 WebKit 的 touch callout；
+   * pointer-events:none 让长按命中方格而不是图片本身，方格的拖拽状态机仍能收到事件。
+   */
   width: calc(var(--content-size, var(--tile-size)) * 0.56);
   height: calc(var(--content-size, var(--tile-size)) * 0.56);
   object-fit: contain;
+  -webkit-touch-callout: none;
+  -webkit-user-drag: none;
+  -webkit-user-select: none;
+  user-select: none;
+  pointer-events: none;
   /*
    * 未就绪时透明，is-ready 时淡入。
    * 只动 opacity 不动 display / v-if：图必须一直在文档里，否则它压根不会开始下载，
